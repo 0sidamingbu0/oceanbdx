@@ -127,13 +127,28 @@ class Sim:
         self.rl_target = self.stand_pose.copy()
         self.rl_tick = 0
         self.stand_start = self.sit_pose.copy()
+
+        # 虚拟坐凳 (复刻真机底座): 坐姿时支撑躯干, 起立完成后下沉移除
+        self.stool_gid = self.model.geom("stool").id
+        self.stool_pos0 = self.model.geom_pos[self.stool_gid].copy()
+        # 坐姿底座高度 = 凳子顶面 + base底部到原点距离 (0.1853, 由mesh测得)
+        stool_top = self.stool_pos0[2] + self.model.geom_size[self.stool_gid][2]
+        self.sit_base_height = stool_top + 0.1853 + 0.001  # 1mm 余量
+
         self.reset()
+
+    def _remove_stool(self):
+        """起立完成后将凳子沉入地下, 避免行走时绊脚"""
+        if self.model.geom_pos[self.stool_gid][2] > -0.5:
+            self.model.geom_pos[self.stool_gid][2] = -1.0
+            print("[sim2sim] stool removed")
 
     def reset(self):
         mujoco.mj_resetData(self.model, self.data)
-        # 坐姿初始化
+        self.model.geom_pos[self.stool_gid] = self.stool_pos0  # 恢复凳子
+        # 坐姿初始化: 躯干坐在凳子上, 双脚着地 (与真机底座启动一致)
         self.data.qpos[self.q_adr] = self.sit_pose
-        self.data.qpos[2] = 0.35  # 底座坐姿高度, 按实际底座调整
+        self.data.qpos[2] = self.sit_base_height
         mujoco.mj_forward(self.model, self.data)
         self.state = "SIT"
         self.state_time = 0.0
@@ -202,6 +217,7 @@ class Sim:
             target = self.stand_start * (1 - a) + self.stand_pose * a
             kp, kd = self.fixed_kp, self.fixed_kd
             if r >= 1.0:
+                self._remove_stool()  # 站立后移除坐凳, 防止绊脚
                 if self.policy:
                     self.policy.reset()
                     self.rl_target = self.stand_pose.copy()
