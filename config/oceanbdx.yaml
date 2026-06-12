@@ -1,0 +1,81 @@
+# OceanBDX 机器人配置
+# 关节向量顺序 (与URDF和IsaacLab训练顺序保持一致, 共10个腿部关节):
+#   [leg_r1, leg_r2, leg_r3, leg_r4, leg_r5, leg_l1, leg_l2, leg_l3, leg_l4, leg_l5]
+# ★ 注意: IsaacLab 解析 USD 后的关节顺序可能与 URDF 不同(常见BFS交错),
+#   训练完成后务必核对 env.scene["robot"].joint_names 并同步修改本文件顺序!
+
+oceanbdx:
+  num_joints: 10
+  joint_names: [leg_r1_joint, leg_r2_joint, leg_r3_joint, leg_r4_joint, leg_r5_joint,
+                leg_l1_joint, leg_l2_joint, leg_l3_joint, leg_l4_joint, leg_l5_joint]
+
+  hardware:
+    # 两路 USB转485, 每条腿一路 (udev规则固定设备名, 见 config/udev/)
+    right_leg:
+      port: /dev/ttyright
+      motor_ids: [1, 2, 3, 4, 5]          # 485总线上的电机ID
+      joint_indices: [0, 1, 2, 3, 4]      # 对应关节向量下标
+    left_leg:
+      port: /dev/ttyleft
+      motor_ids: [1, 2, 3, 4, 5]
+      joint_indices: [5, 6, 7, 8, 9]
+      # 注: 脖子 neck_n1 (M8010, ID=6) 也挂在左腿总线上, 暂不启用
+    gear_ratio: 6.33                      # GO-M8010-6 减速比
+    imu_port: /dev/ttyimu                 # YIS320, USB转串口
+    imu_baud: 460800
+    neck_port: /dev/ttyneck               # 飞特舵机总线 (暂不启用)
+    neck_baud: 115200
+    neck_enabled: false
+
+  calibration:
+    # 电机零位 = 结构限位位置; URDF零位 = 站立姿态
+    #   q_urdf = direction * q_motor + limit_pose
+    # directions: 电机正方向与URDF正方向是否一致 (+1/-1), 逐关节实测!
+    directions: [1, 1, 1, 1, 1,  1, 1, 1, 1, 1]
+    # limit_pose: 结构限位在URDF坐标系下的角度 (rad)
+    # ★ 占位值 = URDF关节下限, 必须用 scripts/measure_offset.py 在可视化中
+    #   把模型摆到限位位置读取实际值后替换!
+    limit_pose: [-0.436, -0.750, -1.361, -0.803, -1.396,
+                 -0.349, -0.262, -0.489, -1.344, -1.134]
+    # sit_pose: 坐姿启动时各关节的URDF角度 (rad), 由底座结构决定, 实测后填写
+    sit_pose: [0.0, -0.5, -1.0, 1.0, 0.0,
+               0.0, 0.5, 1.0, -1.0, 0.0]
+    # stand_pose: 站立目标角度 (URDF零位 = 站立, 故全0)
+    stand_pose: [0, 0, 0, 0, 0,  0, 0, 0, 0, 0]
+    # 上电坐姿校验容差 (rad): |q读数 - sit_pose| 超过即拒绝使能
+    boot_tolerance: 0.30
+
+  control:
+    dt: 0.005                  # 主控制周期 200Hz
+    decimation: 4              # 策略周期 = 0.005*4 = 50Hz
+    fixed_kp: [50, 50, 50, 50, 50,  50, 50, 50, 50, 50]   # 脚本模式 (坐姿保持/起立)
+    fixed_kd: [3, 3, 3, 3, 3,  3, 3, 3, 3, 3]
+    rl_kp:    [50, 50, 50, 50, 50,  50, 50, 50, 50, 50]   # RL模式 (须与训练一致)
+    rl_kd:    [2.5, 2.5, 2.5, 2.5, 2.5,  2.5, 2.5, 2.5, 2.5, 2.5]
+    torque_limits: [23, 23, 23, 23, 23,  23, 23, 23, 23, 23]  # M8010输出轴≈23.7N.m
+    # 软限位 (URDF限位收缩0.02rad)
+    joint_lower: [-0.416, -0.730, -1.341, -0.783, -1.376,
+                  -0.329, -0.242, -0.469, -1.324, -1.114]
+    joint_upper: [0.329, 0.242, 0.469, 1.324, 1.114,
+                  0.416, 0.730, 1.341, 0.783, 1.376]
+    stand_duration: 3.0        # 起立脚本时长 (s)
+    damping_kd: 3.0            # 阻尼保护 kd
+
+  policy:
+    path: policy/policy.onnx   # IsaacLab rsl_rl 导出的 ONNX
+    num_obs: 0                 # 0 = 自动 9+3*num_joints
+    # 以下缩放必须与 IsaacLab 训练配置一致
+    ang_vel_scale: 0.25
+    dof_pos_scale: 1.0
+    dof_vel_scale: 0.05
+    action_scale: 0.25
+    clip_actions: 100.0
+    clip_obs: 100.0
+    commands_scale: [2.0, 2.0, 0.25]
+    # 策略的 default joint pos (训练时 init_state.joint_pos), 站立姿态为全0
+    default_dof_pos: [0, 0, 0, 0, 0,  0, 0, 0, 0, 0]
+
+  command:
+    max_vx: 0.5
+    max_vy: 0.3
+    max_wz: 0.8

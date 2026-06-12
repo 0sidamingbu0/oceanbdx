@@ -1,0 +1,7 @@
+numpy
+pyyaml
+mujoco>=3.2
+onnxruntime
+numpy-stl       # STL格式转换 (仅mesh处理需要)
+trimesh         # mesh简化 (仅mesh处理需要)
+fast_simplification

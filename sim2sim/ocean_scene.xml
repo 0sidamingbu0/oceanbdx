@@ -1,0 +1,125 @@
+<mujoco model="ocean">
+  <compiler angle="radian" meshdir="../description/meshes/"/>
+
+  <option timestep="0.001" integrator="implicitfast"/>
+
+  <default>
+    <joint armature="0.01" damping="0.05 0.05 0.05"/>
+  </default>
+
+  <asset>
+    <mesh name="base_link" file="base_link.STL"/>
+    <mesh name="leg_r1_link" file="leg_r1_link.STL"/>
+    <mesh name="leg_r2_link" file="leg_r2_link.STL"/>
+    <mesh name="leg_r3_link" file="leg_r3_link.STL"/>
+    <mesh name="leg_r4_link" file="leg_r4_link.STL"/>
+    <mesh name="leg_r5_link" file="leg_r5_link.STL"/>
+    <mesh name="leg_l1_link" file="leg_l1_link.STL"/>
+    <mesh name="leg_l2_link" file="leg_l2_link.STL"/>
+    <mesh name="leg_l3_link" file="leg_l3_link.STL"/>
+    <mesh name="leg_l4_link" file="leg_l4_link.STL"/>
+    <mesh name="leg_l5_link" file="leg_l5_link.STL"/>
+    <mesh name="neck_n1_link" file="neck_n1_link.STL"/>
+    <mesh name="neck_n2_link" file="neck_n2_link.STL"/>
+    <mesh name="neck_n3_link" file="neck_n3_link.STL"/>
+    <mesh name="neck_n4_link" file="neck_n4_link.STL"/>
+    <mesh name="imu_link" file="imu_link.STL"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="0 0 0.05" type="plane"/>
+    <light pos="0 0 3" dir="0 0 -1" type="directional"/>
+    <body name="base_link" pos="0 0 0.55">
+      <inertial pos="0.033838 -0.0012004 -0.053283" quat="0.999794 0.00897417 0.0181415 0.00115492" mass="4.2921" diaginertia="0.0134027 0.0107175 0.00907378"/>
+      <joint type="free" armature="0" damping="0 0 0"/>
+      <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.79216 0.81961 0.93333 1" mesh="base_link"/>
+      <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="base_link"/>
+      <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="imu_link"/>
+      <geom type="mesh" rgba="1 1 1 1" mesh="imu_link"/>
+      <body name="leg_r1_link" pos="0.020771 0.045349 -0.0423" quat="-3.67321e-06 -1 0 0">
+        <inertial pos="-0.0041199 -0.0058777 0.050037" quat="0.998758 0.0203693 -0.0454518 0.00128451" mass="0.33146" diaginertia="0.000500472 0.000305153 0.000255335"/>
+        <joint name="leg_r1_joint" pos="0 0 0" axis="0 0 -1" range="-0.436 0.349" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r1_link"/>
+        <geom type="mesh" rgba="1 1 1 1" mesh="leg_r1_link"/>
+        <body name="leg_r2_link" pos="-0.019601 -0.0054769 0.055609" quat="0.499998 -0.5 -0.500002 0.5">
+          <inertial pos="-0.03259 -8.6224e-05 0.0065541" quat="-0.00251301 0.675586 -0.000896157 0.737276" mass="0.15568" diaginertia="0.000186587 0.00016138 6.86436e-05"/>
+          <joint name="leg_r2_joint" pos="0 0 0" axis="0 0 -1" range="-0.75 0.262" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r2_link"/>
+          <geom type="mesh" rgba="1 1 1 1" mesh="leg_r2_link"/>
+          <body name="leg_r3_link" pos="-0.0697599 0 0.00338678" quat="0.5 0.5 0.5 0.5">
+            <inertial pos="-0.039555 -0.043339 -0.018416" quat="0.629773 0.316265 -0.63797 0.310414" mass="0.73927" diaginertia="0.00175415 0.00133691 0.000497944"/>
+            <joint name="leg_r3_joint" pos="0 0 0" axis="0 0 -1" range="-1.361 0.489" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+            <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r3_link"/>
+            <geom type="mesh" rgba="1 1 1 1" mesh="leg_r3_link"/>
+            <body name="leg_r4_link" pos="-0.0848593 -0.0848506 0">
+              <inertial pos="-0.085353 0.013534 0.014528" quat="0.00642643 0.717113 -0.00885571 0.696871" mass="0.45582" diaginertia="0.000782424 0.000605041 0.000231855"/>
+              <joint name="leg_r4_joint" pos="0 0 0" axis="0 0 -1" range="-0.803 1.344" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+              <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r4_link"/>
+              <geom type="mesh" rgba="1 1 1 1" mesh="leg_r4_link"/>
+              <body name="leg_r5_link" pos="-0.135212 0.0362544 -0.00435" quat="0 0.707107 0.707107 0">
+                <inertial pos="0.033054 -0.046256 -0.011541" quat="-0.145138 0.700527 -0.140909 0.684355" mass="0.45151" diaginertia="0.00143562 0.00129174 0.000240893"/>
+                <joint name="leg_r5_joint" pos="0 0 0" axis="0 0 -1" range="-1.396 1.134" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+                <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r5_link"/>
+                <geom type="mesh" rgba="1 1 1 1" mesh="leg_r5_link"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="leg_l1_link" pos="0.0207709 -0.0471506 -0.0423" quat="0 -1 0 0">
+        <inertial pos="-0.0041201 0.0059563 0.050091" quat="0.99877 -0.0199293 -0.0453931 -0.00117301" mass="0.33145" diaginertia="0.000500453 0.000305872 0.000254596"/>
+        <joint name="leg_l1_joint" pos="0 0 0" axis="0 0 -1" range="-0.349 0.436" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l1_link"/>
+        <geom type="mesh" rgba="1 1 1 1" mesh="leg_l1_link"/>
+        <body name="leg_l2_link" pos="-0.0196008 0.00550444 0.0556099" quat="0.499982 0.500018 -0.499982 -0.500018">
+          <inertial pos="-0.032589 8.2716e-05 0.0065541" quat="0.0024465 0.675583 0.000888348 0.737279" mass="0.12555" diaginertia="0.000150473 0.00013015 5.53569e-05"/>
+          <joint name="leg_l2_joint" pos="0 0 0" axis="0 0 -1" range="-0.262 0.75" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l2_link"/>
+          <geom type="mesh" rgba="1 1 1 1" mesh="leg_l2_link"/>
+          <body name="leg_l3_link" pos="-0.0697588 -1.75243e-05 0.00341301" quat="0.500018 -0.500018 0.499982 -0.499982">
+            <inertial pos="-0.039591 0.043396 -0.018481" quat="0.315877 0.630008 -0.309981 0.638141" mass="0.73927" diaginertia="0.00175405 0.00133751 0.000497319"/>
+            <joint name="leg_l3_joint" pos="0 0 0" axis="0 0 -1" range="-0.489 1.361" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+            <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l3_link"/>
+            <geom type="mesh" rgba="1 1 1 1" mesh="leg_l3_link"/>
+            <body name="leg_l4_link" pos="-0.084864 0.0848758 0" quat="0.707107 0 0 -0.707107">
+              <inertial pos="0.013624 -0.085298 0.014354" quat="0.500911 0.497338 -0.488124 0.513301" mass="0.4525" diaginertia="0.000782217 0.00060412 0.000232503"/>
+              <joint name="leg_l4_joint" pos="0 0 0" axis="0 0 -1" range="-1.344 0.803" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+              <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l4_link"/>
+              <geom type="mesh" rgba="1 1 1 1" mesh="leg_l4_link"/>
+              <body name="leg_l5_link" pos="0.036235 -0.13523 -0.00435" quat="1.34924e-11 -3.67321e-06 1 -3.67321e-06">
+                <inertial pos="-0.034306 -0.042595 -0.010554" quat="-0.136962 0.683929 -0.141743 0.702418" mass="0.39976" diaginertia="0.00127757 0.00113059 0.000235971"/>
+                <joint name="leg_l5_joint" pos="0 0 0" axis="0 0 -1" range="-1.134 1.396" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+                <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l5_link"/>
+                <geom type="mesh" rgba="1 1 1 1" mesh="leg_l5_link"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="neck_n1_link" pos="-0.0742167 0.0150862 0.0205492" quat="0.707107 -0.707107 0 0">
+        <inertial pos="0.0056163 -0.068891 -0.01248" quat="0.578243 0.724909 0.32541 -0.18507" mass="0.24777" diaginertia="0.000290413 0.000285328 9.48585e-05"/>
+        <joint name="neck_n1_joint" pos="0 0 0" axis="0 0 -1" range="-1.065 0.436" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="neck_n1_link"/>
+        <geom type="mesh" rgba="1 1 1 1" mesh="neck_n1_link"/>
+        <body name="neck_n2_link" pos="0.030476 -0.1167 -0.0447" quat="-3.18109e-06 0.866025 -0.500001 1.83661e-06">
+          <inertial pos="0.042035 0.0075777 -0.027871" quat="0.418002 0.429416 0.580928 0.550817" mass="0.10044" diaginertia="0.000104034 9.0963e-05 4.33916e-05"/>
+          <joint name="neck_n2_joint" pos="0 0 0" axis="0 0 -1" range="-0.698 1.326" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="neck_n2_link"/>
+          <geom type="mesh" rgba="1 1 1 1" mesh="neck_n2_link"/>
+          <body name="neck_n3_link" pos="0.0304841 0.0176 -0.0283" quat="0.612372 0.612372 -0.353553 -0.353553">
+            <inertial pos="-0.016589 -2.7487e-06 -0.020892" quat="0.498434 0.501023 -0.498974 0.501562" mass="0.1462" diaginertia="0.00016521 9.3798e-05 9.11839e-05"/>
+            <joint name="neck_n3_joint" pos="0 0 0" axis="0 0 -1" range="-1.571 1.571" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+            <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.75294 0.75294 0.75294 1" mesh="neck_n3_link"/>
+            <geom type="mesh" rgba="0.75294 0.75294 0.75294 1" mesh="neck_n3_link"/>
+            <body name="neck_n4_link" pos="-0.11155 0 -0.0158" quat="0.5 -0.5 -0.5 0.5">
+              <inertial pos="0.00090398 0.010912 -0.10923" quat="0.495855 0.503786 0.52507 0.47395" mass="1.0461" diaginertia="0.00929293 0.0050402 0.00463027"/>
+              <joint name="neck_n4_joint" pos="0 0 0" axis="0 0 -1" range="-0.785 0.785" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
+              <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.75294 0.75294 0.75294 1" mesh="neck_n4_link"/>
+              <geom type="mesh" rgba="0.75294 0.75294 0.75294 1" mesh="neck_n4_link"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

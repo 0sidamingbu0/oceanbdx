@@ -1,0 +1,199 @@
+# OceanBDX 整体方案架构
+
+复刻迪士尼BDX的双足机器人控制系统, 部署于 Jetson Orin Nano, 训练采用 IsaacLab。
+
+## 1. 系统总览
+
+```
+┌─────────────────────────── IsaacLab (训练) ───────────────────────────┐
+│  ocean URDF→USD → velocity任务训练 (rsl_rl) → 导出 policy.onnx        │
+└────────────────────────────────┬──────────────────────────────────────┘
+                                 │ policy.onnx
+              ┌──────────────────┴───────────────────┐
+              ▼                                      ▼
+┌──────── sim2sim (MuJoCo) ────────┐   ┌──── sim2real (Jetson Orin Nano) ────┐
+│ sim2sim/mujoco_sim.py            │   │ oceanbdx_run (C++)                  │
+│  - 同一套观测/动作/FSM逻辑       │   │  ┌─────────── 线程结构 ───────────┐ │
+│  - 验证policy与配置正确性        │   │  │ 左腿485轮询线程  (~350Hz)      │ │
+└──────────────────────────────────┘   │  │ 右腿485轮询线程  (~350Hz)      │ │
+                                       │  │ IMU读取线程     (500Hz+)       │ │
+                                       │  │ 主控制循环      (200Hz)        │ │
+                                       │  │ 键盘/手柄线程   (50Hz)         │ │
+                                       │  └────────────────────────────────┘ │
+                                       └─────────────────────────────────────┘
+```
+
+## 2. 硬件拓扑
+
+| 设备 | 接口 | 设备名(udev) | 说明 |
+|------|------|--------------|------|
+| 右腿 5×GO-M8010-6 | USB转485 #1 | `/dev/ttyright` | 电机ID 1-5 |
+| 左腿 5×GO-M8010-6 | USB转485 #2 | `/dev/ttyleft` | 电机ID 1-5 (脖子n1=ID6同总线, 暂不启用) |
+| YIS320 IMU | USB转串口 | `/dev/ttyimu` | 460800bps, yesense协议 |
+| 脖子 3×飞特舵机 | USB转485 #3 | `/dev/ttyneck` | SMS_STS协议, **暂只移植驱动不控制** |
+| 手柄 | WiFi UDP | 端口12121 | Retroid controlapp (可选, 也可键盘) |
+
+udev固定命名规则见 `config/udev/99-oceanbdx.rules`。
+
+## 3. 软件分层
+
+```
+oceanbdx/
+├── drivers/                  # 从 sarocean 提取的原始驱动 (尽量不改动)
+│   ├── unitree_motor/        # 宇树串口电机SDK (预编译.so, 含Arm64版)
+│   ├── feetech/              # 飞特SCServo舵机驱动
+│   ├── yis_imu/              # YIS320 yesense协议解析 (C)
+│   └── gamepad/              # DeepRobotics UDP手柄
+├── include/oceanbdx/ + src/  # 本工程核心代码
+│   ├── leg_driver            # 单腿485总线驱动 (线程+无锁缓存, 输出轴单位)
+│   ├── imu_driver            # IMU线程 (双缓冲无锁发布)
+│   ├── neck_driver           # 脖子驱动封装 (暂不启用)
+│   ├── calibration           # 电机零位↔URDF零位换算 + 上电坐姿校验
+│   ├── policy                # ONNX策略推理 (观测构造与IsaacLab对齐)
+│   ├── fsm                   # 状态机
+│   └── main                  # 主控制循环 200Hz
+├── tests/                    # 分步调试程序 (见第6节)
+├── config/oceanbdx.yaml      # 全部参数: 端口/零位/增益/策略缩放
+├── description/              # ocean URDF + mesh (从sarocean拷贝, mesh已转二进制并简化)
+├── sim2sim/                  # MuJoCo仿真 (ocean_scene.xml + mujoco_sim.py)
+└── scripts/                  # urdf2mjcf.py, measure_offset.py
+```
+
+### 关节向量约定
+
+全部模块统一使用URDF顺序与URDF坐标 (站立=零位):
+
+```
+[leg_r1, leg_r2, leg_r3, leg_r4, leg_r5, leg_l1, leg_l2, leg_l3, leg_l4, leg_l5]
+```
+
+★ IsaacLab 转USD后关节顺序可能变化(常见BFS交错), 训练后必须核对
+`robot.joint_names`, 不一致时修改 `config/oceanbdx.yaml` 的顺序与映射。
+
+### 单位换算 (M8010, 减速比6.33)
+
+宇树SDK的 q/dq/kp/kd/tau 均为**转子侧**, `leg_driver` 内统一换算为输出轴:
+
+```
+q_rotor = q_out × 6.33        tau_out = tau_rotor × 6.33
+kp_rotor = kp_out / 6.33²     kd_rotor = kd_out / 6.33²
+```
+
+## 4. 零位与标定方案
+
+### 4.1 零位定义
+
+- **URDF零位 = 站立姿态** (训练、仿真、部署统一)
+- **电机零位 = 结构限位位置** (装配时把关节顶到限位, 设电机零点)
+- 换算: `q_urdf = direction × q_motor + limit_pose`
+
+### 4.2 limit_pose 测量流程
+
+1. `python3 scripts/urdf2mjcf.py` 生成可视化模型
+2. `python3 scripts/measure_offset.py` 打开MuJoCo viewer
+3. 对照实物把模型每个关节拖到结构限位位置
+4. 终端读出各关节角度 → 填入 `calibration.limit_pose`
+5. 同样方法摆出底座坐姿 → 填入 `calibration.sit_pose`
+
+### 4.3 上电流程 (解决单圈绝对值+减速机的多圈歧义)
+
+M8010转子单圈绝对值编码器经6.33减速后, 输出轴每 360°/6.33≈56.9° 读数重复。
+因此:
+
+1. 机器人放在**专用底座上坐姿上电**, 各关节由底座约束在已知小角度范围内
+2. 状态机 `BOOT_CHECK`: 读取全部关节, 校验 `|q_urdf - sit_pose| < boot_tolerance(0.3rad)`
+3. 校验通过才允许使能; 失败则停在PASSIVE并提示越界关节
+   (说明上电时关节不在预期圈数内, 需手动摆正后重新上电)
+
+`boot_tolerance` 必须 < 56.9°/2 ≈ 0.49 rad, 默认0.30 rad留出余量。
+
+## 5. 状态机设计 (启动→站立→RL)
+
+```
+PASSIVE ──0──▶ BOOT_CHECK ──通过──▶ SIT_HOLD ──1──▶ STAND_UP ──完成──▶ RL_BALANCE ──2──▶ RL_WALK
+   ▲                │失败                            (脚本插值)            (cmd=0)    ◀──3──┘
+   └────────────────┘                  任意状态 ──9/姿态保护──▶ DAMPING (kd阻尼软停)
+```
+
+**起立用脚本而不是RL** (设计决策):
+
+- 起立是确定性大范围姿态变化, 余弦插值脚本 (3s, sit_pose→stand_pose) 最安全可控;
+- RL策略只在站立附近的状态分布内训练 (自平衡+行走), 起立完成瞬间切入RL,
+  此时机器人姿态≈训练初始分布, 衔接风险最小;
+- 若以后想做RL起立, 在FSM新增状态复用同一policy接口即可。
+
+**RL_BALANCE 与 RL_WALK 共用同一policy**, 仅速度指令不同 (0 vs 手柄/固定速度),
+这与IsaacLab velocity任务的训练方式一致 (指令包含0速度的采样范围)。
+
+**安全保护**:
+- 姿态保护: projected_gravity_z > -0.5 (倾倒约60°) → DAMPING
+- 软限位: RL输出目标角clamp到URDF限位内缩0.02rad
+- 力矩限幅: 逐关节 torque_limits
+- Ctrl+C / 退出: 自动发阻尼命令再断电机
+
+## 6. 分步调试路线 (bring-up)
+
+按顺序执行, 每步通过后再进行下一步:
+
+| 步骤 | 程序 | 验证内容 | 通过标准 |
+|------|------|----------|---------|
+| 1 | `test_leg_motor /dev/ttyright 5` | 单腿只读 | 5电机在线, >200Hz, 手转关节读数正确 |
+| 2 | `test_leg_motor /dev/ttyright 5 hold` | 小增益保持 | 关节有弹性阻力, 无抖动 |
+| 3 | 同上换 `/dev/ttyleft` | 另一条腿 | 同上 |
+| 4 | `test_imu` | IMU | 频率正常, 静止时quat≈(1,0,0,0), accel_z≈9.8 |
+| 5 | `test_neck` | 飞特舵机驱动 | 3舵机可读位置 (只验证驱动, 不控制) |
+| 6 | `test_gamepad` | 手柄 | 摇杆/按键数据正确 |
+| 7 | `measure_offset.py` | 测limit_pose/sit_pose | 填好config标定段 |
+| 8 | `test_calibration` | 零位换算+方向 | 限位处q_motor≈0; 坐姿boot check PASS; 转动方向与URDF一致(否则改direction) |
+| 9 | `mujoco_sim.py --no-policy` | 起立脚本 | 仿真中能从坐姿站起不倒 (需真实sit_pose) |
+| 10 | IsaacLab训练 → `mujoco_sim.py` | sim2sim | 仿真中RL站立稳定, 能定速行走 |
+| 11 | `oceanbdx_run` (吊起/底座) | sim2real空载 | FSM全流程, 关节响应正确 |
+| 12 | `oceanbdx_run` (落地) | sim2real | 起立→RL站立→小速度行走 |
+
+第11步建议先吊起机器人空腿验证RL输出是否合理, 再落地。
+
+## 7. IsaacLab 训练约定
+
+最小功能点: velocity 任务 (站立平衡 = 0速度指令, 行走 = 小速度指令)。
+
+部署侧 (`src/policy.cpp` / `sim2sim/mujoco_sim.py`) 假定观测为:
+
+```
+[ base_ang_vel*0.25, projected_gravity, commands*(2,2,0.25),
+  (dof_pos - default_dof_pos)*1.0, dof_vel*0.05, last_actions ]   共 9+3×10=39 维
+动作: target_q = default_dof_pos + 0.25 * action
+```
+
+训练配置必须与 `config/oceanbdx.yaml` 的 policy 段一致 (缩放/默认关节角/kp/kd),
+导出: `rsl_rl` 的 play 脚本自动导出 `exported/policy.onnx`, 放到 `policy/policy.onnx`。
+
+注意事项:
+- `init_state.joint_pos` 用站立姿态 (全0), 与 default_dof_pos 一致
+- actuator 用 ImplicitActuator, stiffness/damping = rl_kp/rl_kd (50/2.5)
+- 关节顺序: 核对USD解析后的 joint_names, 同步修改yaml
+- 脖子4关节在训练中可固定 (fixed joint 或不暴露给policy)
+
+## 8. 部署环境 (Jetson Orin Nano)
+
+```bash
+sudo apt install build-essential cmake libyaml-cpp-dev
+# onnxruntime: 下载 aarch64 release 包 (https://github.com/microsoft/onnxruntime/releases)
+tar xzf onnxruntime-linux-aarch64-*.tgz -C /opt && sudo mv /opt/onnxruntime-* /opt/onnxruntime
+
+cd oceanbdx && mkdir build && cd build
+cmake .. -DONNXRUNTIME_ROOT=/opt/onnxruntime
+make -j4
+
+sudo cp ../config/udev/99-oceanbdx.rules /etc/udev/rules.d/   # 先按实际硬件改serial!
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+实时性建议: 主程序用 `sudo chrt -f 50 ./oceanbdx_run ../config/oceanbdx.yaml`
+或对串口线程设置CPU亲和性; Jetson设置 `sudo jetson_clocks` 锁定频率。
+
+## 9. 后续扩展 (不在最小功能点内)
+
+- 脖子FT舵机控制 (驱动已就绪: `neck_driver`, `neck_enabled: true` 激活)
+- 手柄接入主控制 (驱动已就绪: `drivers/gamepad`, 参照 `tests/test_gamepad.cpp`)
+- 电池监控 (sarocean中有A5协议参考实现)
+- 复杂步态 / 表演动作 (BDX风格的animation重定向)

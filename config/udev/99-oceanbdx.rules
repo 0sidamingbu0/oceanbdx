@@ -1,0 +1,26 @@
+# OceanBDX USB串口设备固定命名规则
+# 安装: sudo cp 99-oceanbdx.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+#
+# ★ 必须根据实际硬件修改匹配条件!
+# 查看序列号/路径:
+#   udevadm info -a -n /dev/ttyUSB0 | grep -E 'serial|devpath|idVendor|idProduct'
+#
+# 方式1: USB转485模块有唯一序列号时, 用 ATTRS{serial} 区分 (推荐)
+# 方式2: 序列号相同(常见于同型号CH340), 用 KERNELS 物理USB口路径区分,
+#        此时固定每个模块插固定的USB口
+
+# --- 左腿 USB-485 (示例: FTDI, 按实际serial修改) ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="LEFTLEG01", SYMLINK+="ttyleft", MODE="0666"
+
+# --- 右腿 USB-485 ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="RIGHTLEG1", SYMLINK+="ttyright", MODE="0666"
+
+# --- YIS320 IMU USB转串口 ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="ttyimu", MODE="0666"
+
+# --- 脖子飞特舵机 USB转485 (暂不启用) ---
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="ttyneck", MODE="0666"
+
+# 物理口路径区分示例 (Jetson Orin Nano, 按 udevadm info 输出的 KERNELS 修改):
+# SUBSYSTEM=="tty", KERNELS=="1-2.1:1.0", SYMLINK+="ttyleft", MODE="0666"
+# SUBSYSTEM=="tty", KERNELS=="1-2.2:1.0", SYMLINK+="ttyright", MODE="0666"
