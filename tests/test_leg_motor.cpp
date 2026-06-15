@@ -66,7 +66,7 @@ int main(int argc, char **argv)
             if (hold && hold_init[i])
             {
                 cmd.q = hold_q[i] * gr;           // 转子侧
-                cmd.kp = 10.0 / (gr * gr);        // 输出轴 kp=10 -> 转子侧
+                cmd.kp = 20.0 / (gr * gr);        // 输出轴 kp=10 -> 转子侧
                 cmd.kd = 0.5 / (gr * gr);
             }
 

@@ -34,13 +34,18 @@ int main(int argc, char **argv)
         GamepadState s = pad.GetState();
         printf("\033[2J\033[H=== USB gamepad %s | %s ===\n", device.c_str(),
                s.connected ? "CONNECTED" : "DISCONNECTED");
-        printf("LX=%6.3f LY=%6.3f  RX=%6.3f RY=%6.3f  LT=%6.3f RT=%6.3f  DPad(%+.0f,%+.0f)\n",
+
+        // --- 已知映射 ---
+        printf("LX=%6.3f LY=%6.3f  RX=%6.3f RY=%6.3f  DPad(%+.0f,%+.0f)\n",
                s.axes[kAxisLeftX], s.axes[kAxisLeftY], s.axes[kAxisRightX], s.axes[kAxisRightY],
-               s.axes[kAxisLT], s.axes[kAxisRT], s.axes[kAxisDpadX], s.axes[kAxisDpadY]);
-        printf("A=%d B=%d X=%d Y=%d  LB=%d RB=%d  back=%d start=%d power=%d  LS=%d RS=%d\n",
+               s.axes[kAxisDpadX], s.axes[kAxisDpadY]);
+        printf("A=%d B=%d X=%d Y=%d  L1=%d R1=%d  L2=%d R2=%d  select=%d start=%d  LS=%d RS=%d\n",
                s.buttons[kBtnA], s.buttons[kBtnB], s.buttons[kBtnX], s.buttons[kBtnY],
-               s.buttons[kBtnLB], s.buttons[kBtnRB], s.buttons[kBtnBack], s.buttons[kBtnStart],
-               s.buttons[kBtnPower], s.buttons[kBtnLStick], s.buttons[kBtnRStick]);
+               s.buttons[kBtnL1], s.buttons[kBtnR1],
+               s.buttons[kBtnL2], s.buttons[kBtnR2],
+               s.buttons[kBtnSelect], s.buttons[kBtnStart],
+               s.buttons[kBtnLStick], s.buttons[kBtnRStick]);
+
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return 0;
