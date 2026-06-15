@@ -40,21 +40,14 @@ target_include_directories(feetech PUBLIC drivers/feetech)
 add_library(yis_imu STATIC drivers/yis_imu/analysis_data.c)
 target_include_directories(yis_imu PUBLIC drivers/yis_imu)
 
-# ---------------- 手柄 (Retroid/Skydroid UDP) ----------------
-add_library(gamepad STATIC
-    drivers/gamepad/src/gamepad.cpp
-    drivers/gamepad/src/retroid_gamepad.cpp
-    drivers/gamepad/src/skydroid_gamepad.cpp
-    drivers/gamepad/src/udp_receiver.cpp)
-target_include_directories(gamepad PUBLIC drivers/gamepad/include)
-target_link_libraries(gamepad PUBLIC Threads::Threads)
-
 # ---------------- oceanbdx 核心库 ----------------
 add_library(oceanbdx_core STATIC
     src/config.cpp
     src/leg_driver.cpp
     src/imu_driver.cpp
     src/neck_driver.cpp
+    src/gamepad_driver.cpp
+    src/battery_driver.cpp
     src/fsm.cpp)
 target_include_directories(oceanbdx_core PUBLIC
     include
@@ -108,5 +101,8 @@ if(BUILD_TESTS)
     target_link_libraries(test_calibration oceanbdx_core)
 
     add_executable(test_gamepad tests/test_gamepad.cpp)
-    target_link_libraries(test_gamepad gamepad)
+    target_link_libraries(test_gamepad oceanbdx_core)
+
+    add_executable(test_battery tests/test_battery.cpp)
+    target_link_libraries(test_battery oceanbdx_core)
 endif()

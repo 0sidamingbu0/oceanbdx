@@ -26,6 +26,10 @@ oceanbdx:
     neck_port: /dev/ttyneck               # 飞特舵机总线 (暂不启用)
     neck_baud: 115200
     neck_enabled: false
+    gamepad_device: /dev/input/js0        # USB 2.4G 无线手柄 (Linux joystick, XInput)
+    battery_port: /dev/ttybat             # 电池 BMS, USB转串口 (A5协议)
+    battery_baud: 9600
+    battery_enabled: false                # 电池监控默认关闭
 
   calibration:
     # 电机零位 = 结构限位位置; URDF零位 = 站立姿态

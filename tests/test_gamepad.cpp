@@ -1,12 +1,16 @@
 /*
- * 调试步骤5: 手柄测试 (Retroid UDP 手柄, 来自 DeepRobotics gamepad 库)
+ * 调试步骤6: USB 手柄测试 (Linux joystick, /dev/input/jsX)
  *
- * 手机装 controlapp 连同一局域网, UDP端口默认 12121。
- * 用法: ./test_gamepad [port]
+ * 适用于 USB 2.4G 无线手柄 (XInput 模式, 如罗技 F710)。
+ * 用法: ./test_gamepad [/dev/input/js0]
+ * 验证要点:
+ *   - connected = YES, 拨动摇杆 axes 在 -1..1 平滑变化
+ *   - 按键 A/B/X/Y/LB/RB 等按下时对应位变 1
+ *   - 方向键体现在 axes[6]/axes[7]
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#include "retroid_gamepad.h"
+#include "oceanbdx/gamepad_driver.hpp"
 
 #include <chrono>
 #include <csignal>
@@ -18,21 +22,25 @@ static void OnSig(int) { g_run = false; }
 
 int main(int argc, char **argv)
 {
-    int port = (argc > 1) ? std::atoi(argv[1]) : 12121;
+    std::string device = (argc > 1) ? argv[1] : "/dev/input/js0";
     signal(SIGINT, OnSig);
 
-    RetroidGamepad pad(port);
-    pad.StartDataThread();
+    oceanbdx::GamepadDriver pad(device);
+    if (!pad.Start()) return -1;
 
+    using namespace oceanbdx;
     while (g_run)
     {
-        RetroidKeys k = pad.GetKeys();
-        printf("\033[2J\033[H=== retroid gamepad udp:%d ===\n", port);
-        printf("LX=%6.3f LY=%6.3f RX=%6.3f RY=%6.3f\n",
-               k.left_axis_x, k.left_axis_y, k.right_axis_x, k.right_axis_y);
-        printf("A=%d B=%d X=%d Y=%d L1=%d R1=%d L2=%d R2=%d start=%d select=%d\n",
-               k.A, k.B, k.X, k.Y, k.L1, k.R1, k.L2, k.R2, k.start, k.select);
-        printf("dpad: up=%d down=%d left=%d right=%d\n", k.up, k.down, k.left, k.right);
+        GamepadState s = pad.GetState();
+        printf("\033[2J\033[H=== USB gamepad %s | %s ===\n", device.c_str(),
+               s.connected ? "CONNECTED" : "DISCONNECTED");
+        printf("LX=%6.3f LY=%6.3f  RX=%6.3f RY=%6.3f  LT=%6.3f RT=%6.3f  DPad(%+.0f,%+.0f)\n",
+               s.axes[kAxisLeftX], s.axes[kAxisLeftY], s.axes[kAxisRightX], s.axes[kAxisRightY],
+               s.axes[kAxisLT], s.axes[kAxisRT], s.axes[kAxisDpadX], s.axes[kAxisDpadY]);
+        printf("A=%d B=%d X=%d Y=%d  LB=%d RB=%d  back=%d start=%d power=%d  LS=%d RS=%d\n",
+               s.buttons[kBtnA], s.buttons[kBtnB], s.buttons[kBtnX], s.buttons[kBtnY],
+               s.buttons[kBtnLB], s.buttons[kBtnRB], s.buttons[kBtnBack], s.buttons[kBtnStart],
+               s.buttons[kBtnPower], s.buttons[kBtnLStick], s.buttons[kBtnRStick]);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return 0;

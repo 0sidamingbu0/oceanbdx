@@ -19,9 +19,9 @@
 ## 目录结构
 
 ```
-drivers/           提取的硬件驱动 (宇树M8010串口SDK / 飞特舵机 / YIS320 IMU / UDP手柄)
-include/ src/      核心控制代码 (驱动封装、标定、FSM、策略、主程序)
-tests/             分步调试程序 (单腿/IMU/舵机/手柄/零位)
+drivers/           提取的硬件驱动 (宇树M8010串口SDK / 飞特舵机 / YIS320 IMU)
+include/ src/      核心控制代码 (驱动封装、USB手柄、电池、标定、FSM、策略、主程序)
+tests/             分步调试程序 (单腿/IMU/舵机/手柄/电池/零位)
 config/            机器人配置 + udev规则
 description/       ocean URDF + meshes
 sim2sim/           MuJoCo 仿真验证
@@ -51,9 +51,10 @@ make -j4
 ./build/test_leg_motor /dev/ttyright 5 hold   # 2. 小增益保持
 ./build/test_imu                              # 3. IMU
 ./build/test_neck                             # 4. 飞特舵机 (仅驱动验证)
-./build/test_gamepad                          # 5. 手柄
-python3 scripts/measure_offset.py             # 6. URDF可视化测零位偏移 -> 填config
-./build/test_calibration config/oceanbdx.yaml # 7. 零位/方向校验
+./build/test_gamepad                           # 5. USB手柄 (/dev/input/js0)
+./build/test_battery                           # 6. 电池BMS (/dev/ttybat, A5协议)
+python3 scripts/measure_offset.py              # 7. URDF可视化测零位偏移 -> 填config
+./build/test_calibration config/oceanbdx.yaml  # 8. 零位/方向校验
 ```
 
 ### sim2sim (MuJoCo)

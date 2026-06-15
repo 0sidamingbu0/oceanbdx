@@ -31,7 +31,8 @@
 | 左腿 5×GO-M8010-6 | USB转485 #2 | `/dev/ttyleft` | 电机ID 1-5 (脖子n1=ID6同总线, 暂不启用) |
 | YIS320 IMU | USB转串口 | `/dev/ttyimu` | 460800bps, yesense协议 |
 | 脖子 3×飞特舵机 | USB转485 #3 | `/dev/ttyneck` | SMS_STS协议, **暂只移植驱动不控制** |
-| 手柄 | WiFi UDP | 端口12121 | Retroid controlapp (可选, 也可键盘) |
+| USB手柄 | USB 2.4G无线 | `/dev/input/js0` | Linux joystick, XInput (如罗技F710, 可选, 也可键盘) |
+| 电池 BMS | USB转串口 | `/dev/ttybat` | 9600bps, A5协议 (可选监控) |
 
 udev固定命名规则见 `config/udev/99-oceanbdx.rules`。
 
@@ -42,12 +43,13 @@ oceanbdx/
 ├── drivers/                  # 从 sarocean 提取的原始驱动 (尽量不改动)
 │   ├── unitree_motor/        # 宇树串口电机SDK (预编译.so, 含Arm64版)
 │   ├── feetech/              # 飞特SCServo舵机驱动
-│   ├── yis_imu/              # YIS320 yesense协议解析 (C)
-│   └── gamepad/              # DeepRobotics UDP手柄
+│   └── yis_imu/              # YIS320 yesense协议解析 (C)
 ├── include/oceanbdx/ + src/  # 本工程核心代码
 │   ├── leg_driver            # 单腿485总线驱动 (线程+无锁缓存, 输出轴单位)
 │   ├── imu_driver            # IMU线程 (双缓冲无锁发布)
 │   ├── neck_driver           # 脖子驱动封装 (暂不启用)
+│   ├── gamepad_driver        # USB手柄 (Linux joystick, 双缓冲无锁发布)
+│   ├── battery_driver        # 电池BMS A5串口协议 (线程收发, 双缓冲发布)
 │   ├── calibration           # 电机零位↔URDF零位换算 + 上电坐姿校验
 │   ├── policy                # ONNX策略推理 (观测构造与IsaacLab对齐)
 │   ├── fsm                   # 状态机
@@ -142,7 +144,8 @@ PASSIVE ──0──▶ BOOT_CHECK ──通过──▶ SIT_HOLD ──1──
 | 3 | 同上换 `/dev/ttyleft` | 另一条腿 | 同上 |
 | 4 | `test_imu` | IMU | 频率正常, 静止时quat≈(1,0,0,0), accel_z≈9.8 |
 | 5 | `test_neck` | 飞特舵机驱动 | 3舵机可读位置 (只验证驱动, 不控制) |
-| 6 | `test_gamepad` | 手柄 | 摇杆/按键数据正确 |
+| 6 | `test_gamepad` | USB手柄 | connected, 摇杆/按键数据正确 |
+| 6b | `test_battery` | 电池BMS | VALID, 电压/SOC/电流在合理范围 |
 | 7 | `measure_offset.py` | 测limit_pose/sit_pose | 填好config标定段 |
 | 8 | `test_calibration` | 零位换算+方向 | 限位处q_motor≈0; 坐姿boot check PASS; 转动方向与URDF一致(否则改direction) |
 | 9 | `mujoco_sim.py --no-policy` | 起立脚本 | 仿真中能从坐姿站起不倒 (需真实sit_pose) |
@@ -194,6 +197,6 @@ sudo udevadm control --reload && sudo udevadm trigger
 ## 9. 后续扩展 (不在最小功能点内)
 
 - 脖子FT舵机控制 (驱动已就绪: `neck_driver`, `neck_enabled: true` 激活)
-- 手柄接入主控制 (驱动已就绪: `drivers/gamepad`, 参照 `tests/test_gamepad.cpp`)
-- 电池监控 (sarocean中有A5协议参考实现)
+- 手柄接入主控制 (驱动已就绪: `gamepad_driver` USB手柄, 参照 `tests/test_gamepad.cpp`)
+- 电池监控接入主控制 (驱动已就绪: `battery_driver` A5协议, 参照 `tests/test_battery.cpp`)
 - 复杂步态 / 表演动作 (BDX风格的animation重定向)

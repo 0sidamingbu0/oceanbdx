@@ -59,6 +59,10 @@ Config Config::Load(const std::string &yaml_path)
         c.neck_port = Get<std::string>(hw, "neck_port", "/dev/ttyneck");
         c.neck_baud = Get<int>(hw, "neck_baud", 1000000);
         c.neck_enabled = Get<bool>(hw, "neck_enabled", false);
+        c.gamepad_device = Get<std::string>(hw, "gamepad_device", "/dev/input/js0");
+        c.battery_port = Get<std::string>(hw, "battery_port", "/dev/ttybat");
+        c.battery_baud = Get<int>(hw, "battery_baud", 9600);
+        c.battery_enabled = Get<bool>(hw, "battery_enabled", false);
     }
 
     YAML::Node cal = n["calibration"];

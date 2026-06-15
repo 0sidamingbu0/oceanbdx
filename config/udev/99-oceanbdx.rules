@@ -21,6 +21,13 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="t
 # --- 脖子飞特舵机 USB转485 (暂不启用) ---
 # SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="ttyneck", MODE="0666"
 
+# --- 电池 BMS USB转串口 (A5协议, 9600bps; 按实际模块改匹配条件) ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", ATTRS{serial}=="BATTERY01", SYMLINK+="ttybat", MODE="0666"
+
+# --- USB 手柄 (Linux joystick, 默认 /dev/input/js0, 一般无需固定命名) ---
+# 多手柄/需固定时可按 idVendor/idProduct 软链, 例如罗技 F710:
+# SUBSYSTEM=="input", KERNEL=="js[0-9]*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c21f", SYMLINK+="input/jsgamepad", MODE="0666"
+
 # 物理口路径区分示例 (Jetson Orin Nano, 按 udevadm info 输出的 KERNELS 修改):
 # SUBSYSTEM=="tty", KERNELS=="1-2.1:1.0", SYMLINK+="ttyleft", MODE="0666"
 # SUBSYSTEM=="tty", KERNELS=="1-2.2:1.0", SYMLINK+="ttyright", MODE="0666"

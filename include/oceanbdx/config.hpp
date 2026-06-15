@@ -36,6 +36,11 @@ struct Config
     int neck_baud = 1000000;
     bool neck_enabled = false;         // 脖子暂不启用, 仅移植驱动
 
+    std::string gamepad_device = "/dev/input/js0";  // USB 手柄 (Linux joystick)
+    std::string battery_port = "/dev/ttybat";       // 电池 BMS 串口
+    int battery_baud = 9600;
+    bool battery_enabled = false;      // 电池监控默认关闭, 按需启用
+
     // ---- 标定 (URDF零位 = 站立姿态) ----
     std::vector<double> directions;            // 电机正方向与URDF正方向关系 (+1/-1)
     std::vector<double> sit_pose;              // 坐姿启动时各关节的URDF角度 (rad)
