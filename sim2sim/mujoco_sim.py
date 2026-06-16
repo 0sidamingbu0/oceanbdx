@@ -11,6 +11,10 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 用法 (在 oceanbdx 根目录):
     python3 sim2sim/mujoco_sim.py [--policy policy/policy.onnx] [--config config/oceanbdx.yaml]
     python3 sim2sim/mujoco_sim.py --no-policy     # 无策略, 只验证起立脚本+站立PD保持
+    python3 sim2sim/mujoco_sim.py --manual        # 纯sim: 拖动滑块摆关节角
+    python3 sim2sim/mujoco_sim.py --real          # 真机镜像: 读编码器→sim可视化 (可手动搬动)
+    python3 sim2sim/mujoco_sim.py --real --manual # 真机联调: 拖动滑块→PD下发到真机
+    # ★ --real 需先安装 unitree_actuator_sdk, 且停掉 C++ 主控 oceanbdx_run (串口互斥)
 
 键盘 (MuJoCo viewer 窗口内):
     1 = 起立   2 = 行走   3 = 回平衡   9 = 阻尼   r = 重置
@@ -42,6 +46,82 @@ def quat_rotate_inverse_gravity(q):
         -2.0 * (y * z + w * x),
         -(1.0 - 2.0 * (x * x + y * y)),
     ])
+
+
+class TeleopPanel:
+    """Tkinter 关节角拖动面板: 每个关节一个滑块, 实时显示真机读数。
+
+    与 MuJoCo viewer 并存 (独立窗口), 在主循环里用 update() 非阻塞刷新。
+    """
+
+    def __init__(self, names, lower, upper, init_q, on_sync=None):
+        import tkinter as tk
+        self.tk = tk
+        self.on_sync = on_sync
+        self.root = tk.Tk()
+        self.root.title("OceanBDX 关节联调")
+
+        self.enabled = tk.BooleanVar(value=False)
+        hdr = tk.Frame(self.root)
+        hdr.pack(fill="x", padx=6, pady=4)
+        tk.Checkbutton(hdr, text="使能电机 (PD跟随滑块)", variable=self.enabled,
+                       fg="red").pack(side="left")
+        tk.Button(hdr, text="滑块←当前角", command=self._sync).pack(side="left", padx=8)
+
+        self.scales = []
+        self.real_lbls = []
+        for i, name in enumerate(names):
+            row = tk.Frame(self.root)
+            row.pack(fill="x", padx=6, pady=1)
+            tk.Label(row, text=name, width=12, anchor="w").pack(side="left")
+            var = tk.DoubleVar(value=float(init_q[i]))
+            tk.Scale(row, from_=float(lower[i]), to=float(upper[i]), resolution=0.001,
+                     orient="horizontal", length=240, variable=var).pack(side="left")
+            lbl = tk.Label(row, text="real: --", width=16, anchor="w")
+            lbl.pack(side="left")
+            self.scales.append(var)
+            self.real_lbls.append(lbl)
+
+        self._alive = True
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _close(self):
+        self._alive = False
+
+    def _sync(self):
+        if self.on_sync is None:
+            return
+        q = self.on_sync()
+        if q is not None:
+            for i, var in enumerate(self.scales):
+                var.set(float(q[i]))
+
+    def get_targets(self):
+        return np.array([v.get() for v in self.scales])
+
+    def set_real(self, q, tau=None):
+        for i, lbl in enumerate(self.real_lbls):
+            t = "" if tau is None else f" {tau[i]:+.1f}Nm"
+            lbl.config(text=f"real:{q[i]:+.3f}{t}")
+
+    def is_enabled(self):
+        return bool(self.enabled.get())
+
+    def update(self):
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except self.tk.TclError:
+            self._alive = False
+
+    def alive(self):
+        return self._alive
+
+    def close(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 class Policy:
@@ -103,12 +183,22 @@ class Sim:
         self.stand_duration = ctrl["stand_duration"]
         self.damping_kd = ctrl["damping_kd"]
 
+        self.joint_lower = np.array(ctrl["joint_lower"][:self.nj], dtype=float)
+        self.joint_upper = np.array(ctrl["joint_upper"][:self.nj], dtype=float)
+
         cal = full["calibration"]
-        self.sit_pose = np.array(cal["sit_pose"][:self.nj])
-        self.stand_pose = np.array(cal["stand_pose"][:self.nj])
+        self.sit_pose = np.array(cal["sit_pose"][:self.nj], dtype=float)
+        self.stand_pose = np.array(cal["stand_pose"][:self.nj], dtype=float)
 
         cmd_cfg = full["command"]
         self.max_vel = np.array([cmd_cfg["max_vx"], cmd_cfg["max_vy"], cmd_cfg["max_wz"]])
+
+        # 真机联调 (--real / --manual)
+        self.real_cfg = full.get("real", {})
+        self.want_real = getattr(args, "real", False)
+        self.want_manual = getattr(args, "manual", False)
+        self.bridge = None
+        self.cmd_q = self.stand_pose.copy()
 
         self.policy = None
         if not args.no_policy:
@@ -243,7 +333,88 @@ class Sim:
 
         return tau, neck_tau
 
+    # ---------- 真机联调 / 手动拖动 ----------
+    def _run_teleop(self):
+        """--real / --manual: sim 作为数字孪生, 滑块拖动关节角。"""
+        panel = None
+        # 1) 真机桥接
+        if self.want_real:
+            from real_bridge import RealBridge
+            self.bridge = RealBridge(self.cfg)
+            if not self.bridge.start():
+                print("[real] 启动失败, 退出")
+                return
+            time.sleep(0.1)  # 等首次读数
+            q0 = self.bridge.get_state()[0][:self.nj].copy()
+        else:
+            q0 = self.stand_pose.copy()
+        self.cmd_q = np.asarray(q0, dtype=float).copy()
+
+        # 2) 滑块面板
+        if self.want_manual:
+            try:
+                panel = TeleopPanel(
+                    LEG_JOINTS, self.joint_lower, self.joint_upper, q0,
+                    on_sync=(lambda: self.bridge.get_state()[0][:self.nj] if self.bridge else None),
+                )
+            except Exception as e:
+                print(f"[teleop] 无法创建滑块面板 ({e}); 请安装 python3-tk")
+                if not self.want_real:
+                    return
+
+        # 3) 可视化初始姿态 (移除凳子, 固定机身位姿, 只看关节)
+        mujoco.mj_resetData(self.model, self.data)
+        self.model.geom_pos[self.stool_gid][2] = -1.0
+        self.data.qpos[2] = 0.40
+        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+
+        teleop_kp = np.array(self.real_cfg.get("teleop_kp", [20.0] * self.nj))[:self.nj]
+        teleop_kd = np.array(self.real_cfg.get("teleop_kd", [1.0] * self.nj))[:self.nj]
+        slew = float(self.real_cfg.get("slew_rate", 0.5))
+        loop_dt = 1.0 / float(self.real_cfg.get("poll_hz", 200))
+
+        mode = "REAL+拖动" if (self.want_real and panel) else (
+            "REAL镜像(可手动搬动)" if self.want_real else "纯SIM拖动")
+        print(f"[teleop] 模式={mode}; 拖动滑块调节关节角, 勾选'使能'后才会下发到真机。")
+
+        with mujoco.viewer.launch_passive(self.model, self.data) as v:
+            while v.is_running() and (panel is None or panel.alive()):
+                t0 = time.time()
+                targets = panel.get_targets() if panel else self.cmd_q
+                targets = np.clip(targets, self.joint_lower, self.joint_upper)
+                # 限速: 防止拖动跳变冲击真机
+                step = slew * loop_dt
+                self.cmd_q += np.clip(targets - self.cmd_q, -step, step)
+
+                if self.want_real:
+                    en = panel.is_enabled() if panel else False
+                    self.bridge.set_enabled(en)
+                    self.bridge.set_target(self.cmd_q, teleop_kp, teleop_kd)
+                    q_real, _, tau_real = self.bridge.get_state()
+                    q_real = q_real[:self.nj]
+                    if panel:
+                        panel.set_real(q_real, tau_real[:self.nj])
+                    self.data.qpos[self.q_adr] = q_real  # 镜像真机编码器
+                else:
+                    self.data.qpos[self.q_adr] = self.cmd_q  # 纯 sim 运动学摆姿
+
+                self.data.qpos[self.neck_q_adr] = 0.0
+                mujoco.mj_forward(self.model, self.data)
+                v.sync()
+                if panel:
+                    panel.update()
+                left = loop_dt - (time.time() - t0)
+                if left > 0:
+                    time.sleep(left)
+
+        if self.bridge:
+            self.bridge.stop()
+        if panel:
+            panel.close()
+
     def run(self):
+        if self.want_real or self.want_manual:
+            return self._run_teleop()
         sim_steps_per_ctrl = max(1, int(round(self.control_dt / self.model.opt.timestep)))
         print(f"[sim2sim] sim_dt={self.model.opt.timestep} control_dt={self.control_dt} "
               f"({sim_steps_per_ctrl} substeps), policy {'ON' if self.policy else 'OFF'}")
@@ -268,6 +439,10 @@ if __name__ == "__main__":
     ap.add_argument("--config", default=os.path.join(ROOT, "config/oceanbdx.yaml"))
     ap.add_argument("--policy", default=None, help="覆盖config中的policy路径")
     ap.add_argument("--no-policy", action="store_true", help="仅验证起立脚本, 不加载策略")
+    ap.add_argument("--real", action="store_true",
+                    help="连接真机电机: sim 作数字孪生镜像真机状态 (需先停掉 oceanbdx_run)")
+    ap.add_argument("--manual", action="store_true",
+                    help="打开关节角拖动滑块面板 (可与 --real 组合)")
     args = ap.parse_args()
 
     if not os.path.exists(SCENE_XML):

@@ -1,0 +1,12 @@
+Tue Jun 16 10:57:46 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 0. The simulation is unstable. Time = 0.0010.
+
+Tue Jun 16 11:06:05 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 0. The simulation is unstable. Time = 0.0010.
+
+Tue Jun 16 11:06:05 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+
+Tue Jun 16 11:09:51 2026
+ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
+

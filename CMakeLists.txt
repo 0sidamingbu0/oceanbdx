@@ -63,6 +63,10 @@ else()
     target_link_libraries(oceanbdx_core PUBLIC ${YAML_CPP_LIB})
 endif()
 
+# ---------------- 真机遥操作桥接 (UDP, 仅需 oceanbdx_core, 无 onnxruntime) ----------------
+add_executable(oceanbdx_teleop src/teleop_bridge.cpp)
+target_link_libraries(oceanbdx_teleop oceanbdx_core)
+
 # ---------------- 主控制程序 (需要 onnxruntime) ----------------
 if(BUILD_MAIN)
     find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h
