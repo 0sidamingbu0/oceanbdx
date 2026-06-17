@@ -109,4 +109,8 @@ if(BUILD_TESTS)
 
     add_executable(test_battery tests/test_battery.cpp)
     target_link_libraries(test_battery oceanbdx_core)
+
+    add_executable(calibrate_motor tests/calibrate_motor.cpp)
+    target_include_directories(calibrate_motor PRIVATE ${UNITREE_MOTOR_DIR}/include)
+    target_link_libraries(calibrate_motor ${UNITREE_MOTOR_LIB} Threads::Threads)
 endif()
