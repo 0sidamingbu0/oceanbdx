@@ -36,21 +36,20 @@ oceanbdx:
     #   q_urdf = direction * q_motor + limit_pose
     # directions: 电机正方向与URDF正方向是否一致 (+1/-1), 逐关节实测!
     directions: [-1, -1, 1, -1, -1,  -1, -1, 1, -1, -1]
-    #LEFT:-1 -1 1 -1 -1,
     # limit_pose: 结构限位在URDF坐标系下的角度 (rad)
     # ★ 占位值 = URDF关节下限, 必须实测后替换! 两种方式:
     #   A. 真机反算(推荐): ./test_calibration config/oceanbdx.yaml limit [LU...]
     #      把每个关节顶到结构限位, 回车抓拍, 自动打印本行 (limit_pose = URDF限位 - direction*q_motor)
     #   B. URDF可视化: python3 scripts/measure_offset.py 摆到限位位置读取角度
-    # q_motor 限位处实测值 left right :ULLUU LUULL
+    # q_motor 限位处实测值 left right :
     # l1:0.2885 l2:1.3574 l3:0.4159 l4:0.4380 l5:-1.1027
     # r1:0.8280 r2:0.2635 r3:0.2036 r4:0.7403 r5:1.9115
     #
-    # urdf中限位方向：LEFT：ULLUU RIGHT：LUULL
-    # l1:0.44 l2:-0.26 l3:-0.49 l4:0.8 l5:1.4
+    # urdf中限位方向：LEFT：ULLUU RIGHT：LUULL (URDF实际限位方向)
     # r1:-0.44 r2:0.26 r3:0.49 r4:-0.8 r5:-1.4
-    limit_pose: [0.8, 1, -1, 1, 0,
-                 0.8, 1, -1, 1, 0]
+    # l1:0.44 l2:-0.26 l3:-0.49 l4:0.8 l5:1.4
+    limit_pose: [-0.44, 0.26, 0.49, -0.8, -1.4,
+                 0.44, -0.26, -0.49, 0.8, 1.4]
     # sit_pose: 坐姿启动时各关节的URDF角度 (rad), 由底座结构决定, 实测后填写
     # ★ 髋侧摆(r2/l2)必须为0: 若坐姿外摆, 起立时双脚需横向滑移,
     #   会被地面摩擦锁死导致侧翻 (sim2sim验证结论)
