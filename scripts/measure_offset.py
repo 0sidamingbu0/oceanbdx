@@ -2,13 +2,16 @@
 """
 OceanBDX 零位偏移测量工具 (URDF可视化)
 
-用途: 测量 "结构限位位置" 与 "站立位置(URDF零位)" 的差值, 填入
-config/oceanbdx.yaml 的 calibration.limit_pose。
+用途: 测量 "结构限位位置" 在 URDF 坐标系下的角度值, 填入
+config/oceanbdx.yaml 的 calibration.urdf_offset。
+同时, 需实测电机在限位位置的角度值, 填入 calibration.q_motor_offset。
 
 原理:
-  电机零位在装配时设置于结构限位处, 因此
-      q_urdf = direction * q_motor + limit_pose
-  其中 limit_pose 即限位位置在URDF坐标系下的角度。
+  电机不支持零位校正, 通过测量限位位置的电机角度值和 URDF 角度值完成标定:
+      q_urdf = direction * (q_motor - q_motor_offset) + urdf_offset
+  其中 q_motor_offset 为限位位置的电机输出轴角度 (实测),
+      urdf_offset 为限位位置在 URDF 坐标系下的角度 (由本工具读出)。
+  URDF 零位为站立姿态, 电机在 0 度时也对应站立姿态。
 
 用法 (在 oceanbdx 根目录):
     python3 scripts/measure_offset.py
@@ -16,7 +19,7 @@ config/oceanbdx.yaml 的 calibration.limit_pose。
 操作:
   - MuJoCo viewer 会以可拖动滑块的方式显示模型 (双击关节/用左侧joint面板拖动)
   - 把每个关节拖到结构限位位置 (与实物对照!)
-  - 终端每秒打印当前所有关节角度, 即可读出 limit_pose
+  - 终端每秒打印当前所有关节角度, 即可读出 urdf_offset
   - 站立姿态 = 全部归零 (URDF零位)
   - 同样方法可把模型摆成坐姿, 读出 sit_pose
 
@@ -64,7 +67,7 @@ def main():
                 for j in JOINTS:
                     q = data.qpos[q_adr[j]]
                     print(f"{j:16s} {q:8.4f}   [{lim[j][0]:7.3f}, {lim[j][1]:7.3f}]")
-                print("limit_pose 行 (按当前姿势, 腿部10关节):")
+                print("urdf_offset 行 (按当前姿势, 腿部10关节):")
                 vals = ", ".join(f"{data.qpos[q_adr[j]]:.3f}" for j in JOINTS[:10])
                 print(f"  [{vals}]")
             time.sleep(0.02)

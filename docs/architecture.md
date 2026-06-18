@@ -86,15 +86,23 @@ kp_rotor = kp_out / 6.33²     kd_rotor = kd_out / 6.33²
 ### 4.1 零位定义
 
 - **URDF零位 = 站立姿态** (训练、仿真、部署统一)
-- **电机零位 = 结构限位位置** (装配时把关节顶到限位, 设电机零点)
-- 换算: `q_urdf = direction × q_motor + limit_pose`
+- **电机不支持零位校正**, 通过测量限位位置的电机角度值和URDF角度值完成标定:
+  - `q_motor_offset`: 限位位置的电机输出轴角度 (实测)
+  - `urdf_offset`: 限位位置在URDF坐标系下的角度 (由可视化工具测量)
+- 换算: `q_urdf = direction × (q_motor - q_motor_offset) + urdf_offset`
 
-### 4.2 limit_pose 测量流程
+### 4.2 标定测量流程
 
+**q_motor_offset** (电机限位读数):
+1. 将每个关节缓慢顶到结构限位
+2. `./test_calibration config/oceanbdx.yaml limit` → 按回车抓拍
+3. 将输出填入 `calibration.q_motor_offset`
+
+**urdf_offset** (URDF限位角度):
 1. `python3 scripts/urdf2mjcf.py` 生成可视化模型
 2. `python3 scripts/measure_offset.py` 打开MuJoCo viewer
 3. 对照实物把模型每个关节拖到结构限位位置
-4. 终端读出各关节角度 → 填入 `calibration.limit_pose`
+4. 终端读出各关节角度 → 填入 `calibration.urdf_offset`
 5. 同样方法摆出底座坐姿 → 填入 `calibration.sit_pose`
 
 ### 4.3 上电流程 (解决单圈绝对值+减速机的多圈歧义)
@@ -146,8 +154,8 @@ PASSIVE ──0──▶ BOOT_CHECK ──通过──▶ SIT_HOLD ──1──
 | 5 | `test_neck` | 飞特舵机驱动 | 3舵机可读位置 (只验证驱动, 不控制) |
 | 6 | `test_gamepad` | USB手柄 | connected, 摇杆/按键数据正确 |
 | 6b | `test_battery` | 电池BMS | VALID, 电压/SOC/电流在合理范围 |
-| 7 | `measure_offset.py` | 测limit_pose/sit_pose | 填好config标定段 |
-| 8 | `test_calibration` | 零位换算+方向 | 限位处q_motor≈0; 坐姿boot check PASS; 转动方向与URDF一致(否则改direction) |
+| 7 | `measure_offset.py` + `test_calibration limit` | 测urdf_offset/q_motor_offset/sit_pose | 填好config标定段 |
+| 8 | `test_calibration` | 零位换算+方向 | 坐姿boot check PASS; 转动方向与URDF一致(否则改direction) |
 | 9 | `mujoco_sim.py --no-policy` | 起立脚本 | 仿真中能从坐姿站起不倒 (需真实sit_pose) |
 | 10 | IsaacLab训练 → `mujoco_sim.py` | sim2sim | 仿真中RL站立稳定, 能定速行走 |
 | 11 | `oceanbdx_run` (吊起/底座) | sim2real空载 | FSM全流程, 关节响应正确 |

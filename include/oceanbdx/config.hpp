@@ -42,9 +42,11 @@ struct Config
     bool battery_enabled = false;      // 电池监控默认关闭, 按需启用
 
     // ---- 标定 (URDF零位 = 站立姿态) ----
+    // q_urdf = direction[i] * (q_motor - q_motor_offset[i]) + urdf_offset[i]
     std::vector<double> directions;            // 电机正方向与URDF正方向关系 (+1/-1)
+    std::vector<double> q_motor_offset;        // 电机在限位位置的角度 (rad, 实测)
+    std::vector<double> urdf_offset;           // 限位位置在URDF坐标系下的角度 (rad, 由URDF测量)
     std::vector<double> sit_pose;              // 坐姿启动时各关节的URDF角度 (rad)
-    std::vector<double> limit_pose;            // 结构限位处的URDF角度 (rad, 由URDF可视化工具测量)
     std::vector<double> stand_pose;            // 站立目标角度 (URDF零位附近, 通常全0)
     double boot_tolerance = 0.30;              // 上电标定时允许的姿态误差 (rad)
 
