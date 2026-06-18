@@ -69,8 +69,9 @@ Config Config::Load(const std::string &yaml_path)
     if (cal)
     {
         c.directions = GetVec<double>(cal, "directions");
+        c.q_motor_offset = GetVec<double>(cal, "q_motor_offset");
+        c.urdf_offset = GetVec<double>(cal, "urdf_offset");
         c.sit_pose = GetVec<double>(cal, "sit_pose");
-        c.limit_pose = GetVec<double>(cal, "limit_pose");
         c.stand_pose = GetVec<double>(cal, "stand_pose");
         c.boot_tolerance = Get<double>(cal, "boot_tolerance", 0.30);
     }
@@ -120,8 +121,9 @@ Config Config::Load(const std::string &yaml_path)
         if (v.empty()) v.assign(c.num_joints, def);
     };
     fill(c.directions, 1.0);
+    fill(c.q_motor_offset, 0.0);
+    fill(c.urdf_offset, 0.0);
     fill(c.sit_pose, 0.0);
-    fill(c.limit_pose, 0.0);
     fill(c.stand_pose, 0.0);
     fill(c.fixed_kp, 40.0);
     fill(c.fixed_kd, 2.0);

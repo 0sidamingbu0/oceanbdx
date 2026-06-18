@@ -102,7 +102,7 @@ oceanbdx:
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机
   # 电机驱动走 C++ 同款部署代码, 跑满总线原生频率 (~116Hz/腿), 无 Python GIL 干扰;
   # Python 侧只做 UDP 收发+可视化。复用上面 hardware/calibration 的端口、电机ID、
-  # 减速比、零位换算 (directions/limit_pose)。
+  # 减速比、零位换算 (directions/q_motor_offset/urdf_offset)。
   # ★ 安全: C++ 桥接与 oceanbdx_run 互斥 (争抢串口); 联调前先停掉真机主控。
   real:
     enabled: false                # 文档开关; 实际由命令行 --real 启用

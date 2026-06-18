@@ -14,7 +14,7 @@
  *
  * 安全注意:
  *   - 校准会覆盖电机内部零位, 必须在机器人断电下电(不使能)状态进行
- *   - 校准后务必重新测量并更新 config/oceanbdx.yaml 中的 limit_pose
+ *   - 校准后务必重新测量并更新 config/oceanbdx.yaml 中的 q_motor_offset
  *   - 每次运行只校准一个电机, 执行完自动退出
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
     if (ack_received)
     {
         std::cout << "\n[完成] 电机 ID=" << motor_id << " 编码器零位已写入。\n"
-                  << "  下一步: 将关节摆到坐姿/限位, 运行 test_calibration 重新标定 limit_pose\n"
+                  << "  下一步: 将关节摆到坐姿/限位, 运行 test_calibration 重新标定 q_motor_offset\n"
                   << "          并更新 config/oceanbdx.yaml。\n";
     }
     else

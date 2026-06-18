@@ -7,19 +7,18 @@
  *     ./test_calibration config/oceanbdx.yaml
  *   实时显示 电机原始角 / 换算后URDF角 / sit_pose偏差, 用于:
  *       - 验证 directions: 正向转动关节, URDF角变化方向应与URDF可视化一致 (否则改 direction)
- *       - 验证 limit_pose: 手动摆出坐姿, URDF角应落在 sit_pose ± tolerance
+ *       - 验证标定: 手动摆出坐姿, URDF角应落在 sit_pose ± tolerance
  *
- * [2] 限位标定模式 (反算 limit_pose):
+ * [2] 限位标定模式 (测量 q_motor_offset):
  *     ./test_calibration config/oceanbdx.yaml limit             # 默认每关节顶"下限端"
  *     ./test_calibration config/oceanbdx.yaml limit LULLLLULLL  # 逐关节指定限位侧 (L=下限/U=上限)
  *   操作:
  *       1. 先用监视模式确认 directions 已标定正确
  *       2. 把每个关节缓慢顶到指定的结构限位 (L=URDF下限端 / U=URDF上限端)
- *       3. 顶稳后按回车抓拍 -> 自动反算并打印可直接粘贴的 limit_pose YAML 行
+ *       3. 顶稳后按回车抓拍 -> 自动打印可直接粘贴的 q_motor_offset YAML 行
  *       4. 可反复抓拍取稳定值; 输入 q 回车退出 (或 Ctrl-C)
- *   原理: 关节顶到结构限位时其URDF角已知(=该侧URDF限位 target), 读取原始电机角 q_motor,
- *         由 q_urdf = direction*q_motor + limit_pose 反解:
- *             limit_pose = target - direction * q_motor
+ *   原理: 关节顶到结构限位时读取电机输出轴角度 q_motor, 即为 q_motor_offset。
+ *         urdf_offset 需另行用 scripts/measure_offset.py 测量。
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -115,7 +114,7 @@ int main(int argc, char **argv)
         printf("limit 模式内置 URDF 限位表仅覆盖 10 个腿部关节\n");
         return -1;
     }
-    // 解析每关节限位侧 (L=下限端 / U=上限端), 默认全 L
+    // 解析每关节限位侧 (L=下限端 / U=上限端), 默认全 L (仅用于显示提示)
     std::string side((argc > 3) ? argv[3] : std::string(n, 'L'));
     if ((int)side.size() != n)
     {
@@ -134,26 +133,27 @@ int main(int argc, char **argv)
     std::string snapshot;  // 上次抓拍的 YAML 输出, 持续显示
     while (g_run)
     {
-        printf("\033[2J\033[H=== limit_pose 标定 (顶到结构限位 -> 回车抓拍 / q 退出) ===\n");
-        printf("%-16s %4s %10s %10s %12s\n", "joint", "side", "q_motor", "URDF限位", "limit_pose*");
-        std::vector<double> cur_limit(n);
+        printf("\033[2J\033[H=== q_motor_offset 标定 (顶到结构限位 -> 回车抓拍 / q 退出) ===\n");
+        printf("%-16s %4s %10s %12s\n", "joint", "side", "q_motor", "q_motor_offset*");
+        std::vector<double> cur_offset(n);
         for (int i = 0; i < n; ++i)
         {
             double qm = jmap[i].leg->GetState(jmap[i].idx).q;
-            cur_limit[i] = target[i] - cfg.directions[i] * qm;   // 反算
-            printf("%-16s %4c %10.4f %10.4f %12.4f\n",
-                   cfg.joint_names[i].c_str(), side[i], qm, target[i], cur_limit[i]);
+            cur_offset[i] = qm;   // 限位处的电机输出轴角度即为 q_motor_offset
+            printf("%-16s %4c %10.4f %12.4f\n",
+                   cfg.joint_names[i].c_str(), side[i], qm, cur_offset[i]);
         }
-        printf("\n(*) limit_pose = URDF限位 - direction * q_motor  (实时显示, 顶稳后再抓拍)\n");
+        printf("\n(*) q_motor_offset = 限位处的电机输出轴角度 (实时显示, 顶稳后再抓拍)\n");
+        printf("    urdf_offset 请用 scripts/measure_offset.py 另行测量\n");
 
         if (g_snap.exchange(false))
         {
-            std::string line = "    limit_pose: [";
+            std::string line = "    q_motor_offset: [";
             char buf[64];
             for (int i = 0; i < n; ++i)
             {
-                const char *sep = (i == n - 1) ? "]" : (i == 4 ? ",\n                 " : ", ");
-                snprintf(buf, sizeof(buf), "%.4f%s", cur_limit[i], sep);
+                const char *sep = (i == n - 1) ? "]" : (i == 4 ? ",\n                      " : ", ");
+                snprintf(buf, sizeof(buf), "%.4f%s", cur_offset[i], sep);
                 line += buf;
             }
             snapshot = "已抓拍 -> 粘贴到 config/oceanbdx.yaml 的 calibration: 下:\n" + line + "\n";
