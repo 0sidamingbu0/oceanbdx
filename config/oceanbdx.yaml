@@ -40,10 +40,10 @@ oceanbdx:
     directions: [-1, -1, 1, -1, -1,  -1, -1, 1, -1, -1]
     
     # q_motor_offset 电机在限位位置的角度 (rad), 由电机实际限位位置测得, 需实测后填写 RIGHT：LUULL LEFT：ULLUU
-    # r1:0.8280 r2:0.2635 r3:0.2036 r4:0.7403 r5:1.9115 0.9294
+    # r1:0.8280 r2:0.2635 r3:0.2036 r4:0.7403 r5:1.9115 0.9294 1.04719755
     # l1:0.2885 l2:1.3574 l3:0.4159 l4:0.4380 l5:-1.1027 -0.1051
-    q_motor_offset: [0.8280, 0.2635, 0.2036, 0.7403, 0.9294,
-                 0.2885, 1.3574, 0.4159, 0.4380, -0.1051]    
+    q_motor_offset: [0.8280, 0.2635, 0.2036, 0.7403, 1.9115,
+                 0.2885, 1.3574, 0.4159, 0.4380, -1.1027]    
                  
     # urdf_offset URDF中限位位置的角度 RIGHT：LUULL LEFT：ULLUU  (URDF实际限位方向)
     # r1:-0.44 r2:0.26 r3:0.49 r4:-0.8 r5:-1.4
@@ -110,10 +110,15 @@ oceanbdx:
     udp_port: 9090
     auto_launch: true             # true=Python自动拉起 build/oceanbdx_teleop
     bridge_exec: build/oceanbdx_teleop   # 相对仓库根; auto_launch=false 时需手动启动
-    # 联调位置环增益 (输出轴/URDF侧, 与 control.* 同坐标, 故意偏软防夹手)
+    # 手动滑块联调增益 (仅 --real --manual 使用, 故意偏软防夹手)
     teleop_kp: [20, 20, 20, 20, 20,  20, 20, 20, 20, 20]
     teleop_kd: [1.0, 1.0, 1.0, 1.0, 1.0,  1.0, 1.0, 1.0, 1.0, 1.0]
+    # sim2real 输出增益: 回蹲姿、起立、站立跟随均使用这组增益, 避免切换冲击
+    follow_kp: [50, 50, 50, 80, 80,  50, 50, 50, 80, 80]
+    follow_kd: [4.0, 4.0, 4.0, 4.0, 4.0,  4.0, 4.0, 4.0, 4.0, 4.0]
     slew_rate: 0.5                # rad/s 每关节命令角最大变化率 (限制拖动速度)
+    sit_ready_tolerance: 0.12      # 回蹲姿完成判定: 真机读数距sit_pose的最大允许误差(rad)
+    sit_cmd_tolerance: 0.02        # 回蹲姿完成判定: 内部限速命令距sit_pose的最大允许误差(rad)
     # poll_hz: Python->C++ 的 UDP 心跳/镜像刷新率 (设高无害, 真正电机频率由
     # C++ LegDriver 决定 ~116Hz; 心跳停止 100ms 后 C++ 自动给电机上阻尼)
     poll_hz: 200

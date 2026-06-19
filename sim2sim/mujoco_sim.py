@@ -12,12 +12,13 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
     python3 sim2sim/mujoco_sim.py [--policy policy/policy.onnx] [--config config/oceanbdx.yaml]
     python3 sim2sim/mujoco_sim.py --no-policy     # 无策略, 只验证起立脚本+站立PD保持
     python3 sim2sim/mujoco_sim.py --manual        # 纯sim: 拖动滑块摆关节角
-    python3 sim2sim/mujoco_sim.py --real          # 真机镜像: 读编码器→sim可视化 (可手动搬动)
+    python3 sim2sim/mujoco_sim.py --real --no-policy # 仿真目标角→真机, 面板显示真机误差
     python3 sim2sim/mujoco_sim.py --real --manual # 真机联调: 拖动滑块→PD下发到真机
     # ★ --real 需先安装 unitree_actuator_sdk, 且停掉 C++ 主控 oceanbdx_run (串口互斥)
 
 键盘 (MuJoCo viewer 窗口内):
-    1 = 起立   2 = 行走   3 = 回平衡   9 = 阻尼   r = 重置
+    0 = 真机缓慢到蹲姿   1 = 起立   2 = 行走   3 = 回平衡   9 = 阻尼   r = 重置
+    p = 真机电机输出开关
     ↑/↓ = vx±0.1   ←/→ = wz±0.1   x = 速度清零
 """
 import argparse
@@ -124,6 +125,76 @@ class TeleopPanel:
             pass
 
 
+class RealOutputPanel:
+    """真机输出状态面板: 控制 enable, 显示 sim 目标与真机编码器误差。"""
+
+    def __init__(self, names, on_sit):
+        import tkinter as tk
+        self.tk = tk
+        self.on_sit = on_sit
+        self.root = tk.Tk()
+        self.root.title("OceanBDX sim2real 输出")
+
+        self.enabled = tk.BooleanVar(value=False)
+        hdr = tk.Frame(self.root)
+        hdr.pack(fill="x", padx=6, pady=4)
+        tk.Checkbutton(hdr, text="使能电机输出", variable=self.enabled,
+                       fg="red").pack(side="left")
+        tk.Button(hdr, text="真机缓慢到蹲姿", command=self.on_sit).pack(side="left", padx=8)
+        self.status = tk.Label(hdr, text="DISABLED", width=18, anchor="w")
+        self.status.pack(side="left")
+
+        self.rows = []
+        for name in names:
+            row = tk.Frame(self.root)
+            row.pack(fill="x", padx=6, pady=1)
+            tk.Label(row, text=name, width=12, anchor="w").pack(side="left")
+            lbl = tk.Label(row, text="sim: --  real: --  err: --", width=44, anchor="w")
+            lbl.pack(side="left")
+            self.rows.append(lbl)
+
+        self._alive = True
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _close(self):
+        self._alive = False
+
+    def is_enabled(self):
+        return bool(self.enabled.get())
+
+    def set_enabled(self, on):
+        self.enabled.set(bool(on))
+
+    def set_state(self, sim_q, real_q, tau=None, align_active=False, align_done=False):
+        if align_active:
+            text = "SIT ALIGN" if self.is_enabled() else "ALIGN OFF"
+        elif align_done:
+            text = "SIT READY"
+        else:
+            text = "ENABLED" if self.is_enabled() else "DISABLED"
+        self.status.config(text=text)
+        for i, lbl in enumerate(self.rows):
+            t = "" if tau is None else f" tau:{tau[i]:+.1f}"
+            lbl.config(text=(f"sim:{sim_q[i]:+.3f}  real:{real_q[i]:+.3f}  "
+                             f"err:{(sim_q[i] - real_q[i]):+.3f}{t}"))
+
+    def update(self):
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except self.tk.TclError:
+            self._alive = False
+
+    def alive(self):
+        return self._alive
+
+    def close(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
 class Policy:
     """与 src/policy.cpp 相同的观测构造与动作解码"""
 
@@ -199,6 +270,19 @@ class Sim:
         self.want_manual = getattr(args, "manual", False)
         self.bridge = None
         self.cmd_q = self.stand_pose.copy()
+        self.real_panel = None
+        self.real_output_enabled = False
+        self.real_cmd_q = self.sit_pose.copy()
+        self.real_sit_active = False
+        self.real_sit_done = False
+        self.real_sit_last_print = 0.0
+        self.real_sit_ready_tol = float(self.real_cfg.get("sit_ready_tolerance", 0.12))
+        self.real_sit_cmd_tol = float(self.real_cfg.get("sit_cmd_tolerance", 0.02))
+        self.real_follow_kp = np.array(self.real_cfg.get("follow_kp", self.fixed_kp))[:self.nj]
+        self.real_follow_kd = np.array(self.real_cfg.get("follow_kd", self.fixed_kd))[:self.nj]
+        self.last_target = self.sit_pose.copy()
+        self.last_kp = self.fixed_kp.copy()
+        self.last_kd = self.fixed_kd.copy()
 
         self.policy = None
         if not args.no_policy:
@@ -244,6 +328,9 @@ class Sim:
         self.state_time = 0.0
         self.cmd[:] = 0
         self.rl_target = self.stand_pose.copy()
+        self.last_target = self.sit_pose.copy()
+        self.last_kp = self.fixed_kp.copy()
+        self.last_kd = self.fixed_kd.copy()
         if self.policy:
             self.policy.reset()
         print("[sim2sim] reset to SIT")
@@ -258,7 +345,25 @@ class Sim:
 
     def key_cb(self, keycode):
         c = chr(keycode) if keycode < 256 else ""
-        if c == "1" and self.state == "SIT":
+        if c == "0":
+            self.start_real_sit_align()
+        elif c in ("p", "P"):
+            if not self.bridge:
+                print("[real] 未连接真机桥接, 忽略电机输出开关")
+                return
+            self.real_output_enabled = not self.real_output_enabled
+            if self.real_panel:
+                self.real_panel.set_enabled(self.real_output_enabled)
+            if self.real_output_enabled:
+                self.real_cmd_q = self.bridge.get_state()[0][:self.nj].copy()
+            print(f"[real] motor output {'ENABLED' if self.real_output_enabled else 'DISABLED'}")
+        elif c == "1" and self.state == "SIT":
+            if self.real_sit_active:
+                print("[real] 真机仍在缓慢回蹲姿, 完成后再按 1")
+                return
+            if self.bridge and not self.real_sit_done:
+                print("[real] 先按 0 让真机缓慢回蹲姿; 到位后再按 1")
+                return
             self.stand_start = self.data.qpos[self.q_adr].copy()
             self.state, self.state_time = "STAND_UP", 0.0
             print("[FSM] SIT -> STAND_UP")
@@ -270,9 +375,11 @@ class Sim:
             print("[FSM] RL_WALK -> RL_BALANCE")
         elif c == "9":
             self.state = "DAMPING"
+            self.disable_real_output("DAMPING")
             print("[FSM] -> DAMPING")
         elif c in ("r", "R"):
             self.reset()
+            self.disable_real_output("RESET")
         elif c == "x":
             self.cmd[:] = 0
         elif keycode == 265:  # up
@@ -283,9 +390,93 @@ class Sim:
             self.cmd[2] = min(self.cmd[2] + 0.1, self.max_vel[2])
         elif keycode == 262:  # right
             self.cmd[2] = max(self.cmd[2] - 0.1, -self.max_vel[2])
-        if c in "123":
+        if c in "0123pPrR":
             return
         print(f"cmd = {self.cmd}")
+
+    # ---------- 真机输出 ----------
+    def disable_real_output(self, reason=""):
+        if not self.bridge:
+            return
+        self.real_output_enabled = False
+        self.real_sit_active = False
+        self.real_sit_done = False
+        self.real_cmd_q = self.bridge.get_state()[0][:self.nj].copy()
+        self.bridge.set_enabled(False)
+        self.bridge.set_target(self.real_cmd_q, np.zeros(self.nj), np.full(self.nj, self.damping_kd))
+        if self.real_panel:
+            self.real_panel.set_enabled(False)
+        suffix = f" ({reason})" if reason else ""
+        print(f"[real] motor output DISABLED{suffix}; press 0 to re-home before standing")
+
+    def start_real_sit_align(self):
+        if not self.bridge:
+            print("[real] 未连接真机桥接, 忽略蹲姿触发")
+            return
+        q_real = self.bridge.get_state()[0][:self.nj]
+        self.real_cmd_q = q_real.copy()
+        self.real_sit_active = True
+        self.real_sit_done = False
+        self.real_sit_last_print = 0.0
+        self.reset()
+        if not self.real_output_enabled and self.real_panel:
+            self.real_panel.set_enabled(False)
+        print("[real] 开始缓慢移动到蹲姿; 需要电机输出使能才会实际动作")
+
+    def update_real_output(self):
+        if not self.bridge:
+            return
+
+        if self.real_panel:
+            self.real_output_enabled = self.real_panel.is_enabled()
+
+        q_real, _, tau_real = self.bridge.get_state()
+        q_real = q_real[:self.nj]
+        tau_real = tau_real[:self.nj]
+
+        if not self.real_output_enabled:
+            self.real_cmd_q = q_real.copy()
+
+        if self.real_sit_active:
+            target = np.clip(self.sit_pose, self.joint_lower, self.joint_upper)
+            kp, kd = self.real_follow_kp, self.real_follow_kd
+            cmd_err = float(np.max(np.abs(target - self.real_cmd_q)))
+            real_errs = np.abs(target - q_real)
+            real_err = float(np.max(real_errs))
+            worst = int(np.argmax(real_errs))
+            now = time.time()
+            if now - self.real_sit_last_print > 1.0:
+                self.real_sit_last_print = now
+                en = "ON" if self.real_output_enabled else "OFF"
+                print(f"[real] SIT ALIGN enable={en} cmd_err={cmd_err:.3f} "
+                      f"real_err={real_err:.3f}/{self.real_sit_ready_tol:.3f} "
+                      f"worst={LEG_JOINTS[worst]}")
+            if (self.real_output_enabled and
+                    cmd_err <= self.real_sit_cmd_tol and
+                    real_err <= self.real_sit_ready_tol):
+                self.real_sit_active = False
+                self.real_sit_done = True
+                print("[real] 真机已到蹲姿附近, 可以按 1 起立")
+        else:
+            target = self.last_target
+            if self.state in ("SIT", "STAND_UP", "RL_BALANCE", "RL_WALK"):
+                kp, kd = self.real_follow_kp, self.real_follow_kd
+            else:
+                kp, kd = self.last_kp, self.last_kd
+
+        slew = float(self.real_cfg.get("slew_rate", 0.5))
+        step = slew * self.control_dt
+        if self.real_output_enabled:
+            self.real_cmd_q += np.clip(target - self.real_cmd_q, -step, step)
+        self.real_cmd_q = np.clip(self.real_cmd_q, self.joint_lower, self.joint_upper)
+
+        self.bridge.set_enabled(self.real_output_enabled)
+        self.bridge.set_target(self.real_cmd_q, kp, kd)
+
+        if self.real_panel:
+            self.real_panel.set_state(self.real_cmd_q, q_real, tau_real,
+                                      self.real_sit_active, self.real_sit_done)
+            self.real_panel.update()
 
     # ---------- 控制 ----------
     def control_step(self):
@@ -322,6 +513,10 @@ class Sim:
             target, kp, kd = self.rl_target, self.kp, self.kd
         else:  # DAMPING
             target, kp, kd = q, np.zeros(self.nj), np.full(self.nj, self.damping_kd)
+
+        self.last_target = target.copy()
+        self.last_kp = kp.copy()
+        self.last_kd = kd.copy()
 
         tau = kp * (target - q) - kd * dq
         tau = np.clip(tau, -self.tau_limit, self.tau_limit)
@@ -413,25 +608,45 @@ class Sim:
             panel.close()
 
     def run(self):
-        if self.want_real or self.want_manual:
+        if self.want_manual:
             return self._run_teleop()
         sim_steps_per_ctrl = max(1, int(round(self.control_dt / self.model.opt.timestep)))
         print(f"[sim2sim] sim_dt={self.model.opt.timestep} control_dt={self.control_dt} "
               f"({sim_steps_per_ctrl} substeps), policy {'ON' if self.policy else 'OFF'}")
         print(__doc__)
 
-        with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self.key_cb) as v:
-            while v.is_running():
-                t0 = time.time()
-                tau, neck_tau = self.control_step()
-                for _ in range(sim_steps_per_ctrl):
-                    self.data.qfrc_applied[self.v_adr] = tau
-                    self.data.qfrc_applied[self.neck_v_adr] = neck_tau
-                    mujoco.mj_step(self.model, self.data)
-                v.sync()
-                dt_left = self.control_dt - (time.time() - t0)
-                if dt_left > 0:
-                    time.sleep(dt_left)
+        if self.want_real:
+            from real_bridge import RealBridge
+            self.bridge = RealBridge(self.cfg)
+            if not self.bridge.start():
+                print("[real] 启动失败, 退出")
+                return
+            time.sleep(0.1)
+            self.real_cmd_q = self.bridge.get_state()[0][:self.nj].copy()
+            try:
+                self.real_panel = RealOutputPanel(LEG_JOINTS, self.start_real_sit_align)
+            except Exception as e:
+                print(f"[real] 无法创建输出面板 ({e}); 可用键盘 p/0 控制")
+
+        try:
+            with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self.key_cb) as v:
+                while v.is_running() and (self.real_panel is None or self.real_panel.alive()):
+                    t0 = time.time()
+                    tau, neck_tau = self.control_step()
+                    self.update_real_output()
+                    for _ in range(sim_steps_per_ctrl):
+                        self.data.qfrc_applied[self.v_adr] = tau
+                        self.data.qfrc_applied[self.neck_v_adr] = neck_tau
+                        mujoco.mj_step(self.model, self.data)
+                    v.sync()
+                    dt_left = self.control_dt - (time.time() - t0)
+                    if dt_left > 0:
+                        time.sleep(dt_left)
+        finally:
+            if self.bridge:
+                self.bridge.stop()
+            if self.real_panel:
+                self.real_panel.close()
 
 
 if __name__ == "__main__":
@@ -440,7 +655,7 @@ if __name__ == "__main__":
     ap.add_argument("--policy", default=None, help="覆盖config中的policy路径")
     ap.add_argument("--no-policy", action="store_true", help="仅验证起立脚本, 不加载策略")
     ap.add_argument("--real", action="store_true",
-                    help="连接真机电机: sim 作数字孪生镜像真机状态 (需先停掉 oceanbdx_run)")
+                    help="连接真机电机: 普通sim2sim中输出仿真目标角; 与 --manual 组合时为滑块联调")
     ap.add_argument("--manual", action="store_true",
                     help="打开关节角拖动滑块面板 (可与 --real 组合)")
     args = ap.parse_args()

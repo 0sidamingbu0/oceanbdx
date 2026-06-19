@@ -43,10 +43,10 @@ class RealBridge:
         self.host = real.get("udp_host", "127.0.0.1")
         self.poll_hz = float(real.get("poll_hz", 200))
         self.auto_launch = bool(real.get("auto_launch", True))
-        self.bridge_exec = real.get(
-            "bridge_exec", os.path.join(ROOT, "build/oceanbdx_teleop"))
-        self.config_path = real.get(
-            "config_path", os.path.join(ROOT, "config/oceanbdx.yaml"))
+        self.bridge_exec = self._resolve_path(real.get(
+            "bridge_exec", os.path.join(ROOT, "build/oceanbdx_teleop")))
+        self.config_path = self._resolve_path(real.get(
+            "config_path", os.path.join(ROOT, "config/oceanbdx.yaml")))
 
         self._lock = threading.Lock()
         self._tgt_q = np.zeros(self.n)
@@ -63,6 +63,11 @@ class RealBridge:
         self._proc = None
         self._thread = None
         self._running = False
+
+    def _resolve_path(self, path):
+        if os.path.isabs(path):
+            return path
+        return os.path.join(ROOT, path)
 
     # ---------- 生命周期 ----------
     def start(self):
