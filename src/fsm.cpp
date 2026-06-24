@@ -52,9 +52,15 @@ std::vector<JointCommand> Fsm::Update(const RobotState &s,
 {
     state_time_ += cfg_.control_dt;
 
-    // 全局安全: RL/起立阶段姿态异常 -> 阻尼
+    // 全局安全: 起立/RL阶段必须有有效IMU, 姿态异常 -> 阻尼
     if ((state_ == FsmState::STAND_UP || state_ == FsmState::RL_BALANCE ||
-         state_ == FsmState::RL_WALK) && AttitudeUnsafe(s.imu))
+         state_ == FsmState::RL_WALK) && !s.imu.valid)
+    {
+        message_ = "imu invalid during active control";
+        Transit(FsmState::DAMPING);
+    }
+    else if ((state_ == FsmState::STAND_UP || state_ == FsmState::RL_BALANCE ||
+              state_ == FsmState::RL_WALK) && AttitudeUnsafe(s.imu))
     {
         message_ = "attitude protect triggered";
         Transit(FsmState::DAMPING);
@@ -75,9 +81,17 @@ std::vector<JointCommand> Fsm::Update(const RobotState &s,
     case FsmEvent::STAND:
         if (state_ == FsmState::SIT_HOLD)
         {
-            stand_start_pose_.resize(cfg_.num_joints);
-            for (int i = 0; i < cfg_.num_joints; ++i) stand_start_pose_[i] = s.joints[i].q;
-            Transit(FsmState::STAND_UP);
+            if (!s.imu.valid)
+            {
+                message_ = "stand rejected: imu invalid";
+                std::cerr << "[FSM] " << message_ << std::endl;
+            }
+            else
+            {
+                stand_start_pose_.resize(cfg_.num_joints);
+                for (int i = 0; i < cfg_.num_joints; ++i) stand_start_pose_[i] = s.joints[i].q;
+                Transit(FsmState::STAND_UP);
+            }
         }
         break;
     case FsmEvent::WALK:

@@ -56,7 +56,45 @@ def main():
     floor.name = "floor"
     floor.type = mujoco.mjtGeom.mjGEOM_PLANE
     floor.size = [0, 0, 0.05]
-    floor.friction = [1.0, 0.005, 0.0001]
+    floor.friction = [2.0, 0.02, 0.001]
+
+    # 虚拟坐凳: 真实机器人坐姿靠底座支撑, 顶面高度使坐姿(sit_pose)时双脚正好着地.
+    # 位于躯干底部后侧(x∈[-0.125,-0.085]), 与双脚(x>-0.075)留出间隙;
+    # 起立完成后由 mujoco_sim.py 下沉到地面以下避免绊脚.
+    stool = spec.worldbody.add_geom()
+    stool.name = "stool"
+    stool.type = mujoco.mjtGeom.mjGEOM_BOX
+    stool.size = [0.02, 0.05, 0.0512]
+    stool.pos = [-0.105, 0, 0.0512]
+    stool.rgba = [0.4, 0.3, 0.2, 1]
+
+    # 脚底碰撞: 等高 box 替代 mesh (两脚 STL 底面差 7~10mm 会导致单脚支撑翻倒).
+    # 两脚 box 底面同高, 摩擦与地面一致.
+    foot_r = spec.body("leg_r5_link").add_geom()
+    foot_r.name = "foot_r"
+    foot_r.type = mujoco.mjtGeom.mjGEOM_BOX
+    foot_r.pos = [0.0256, -0.0760, -0.0192]
+    foot_r.size = [0.0921, 0.0040, 0.0145]
+    foot_r.friction = [2.0, 0.02, 0.001]
+    foot_r.rgba = [0.8, 0.2, 0.2, 0.3]
+
+    foot_l = spec.body("leg_l5_link").add_geom()
+    foot_l.name = "foot_l"
+    foot_l.type = mujoco.mjtGeom.mjGEOM_BOX
+    foot_l.pos = [-0.0261, -0.0760, -0.0190]
+    foot_l.size = [0.0926, 0.0040, 0.0149]
+    foot_l.friction = [2.0, 0.02, 0.001]
+    foot_l.rgba = [0.8, 0.2, 0.2, 0.3]
+
+    # 碰撞体仅保留: base_link, 双脚(leg_r5/leg_l5), 凳子, 地面.
+    # 排除剩余自碰撞对: 坐姿双脚靠拢, 摔倒时脚可能贴近躯干,
+    # 避免 mesh-mesh 深穿透引发 mj_collideTree 栈爆炸.
+    for b1, b2 in [("leg_r5_link", "leg_l5_link"),
+                   ("base_link", "leg_r5_link"),
+                   ("base_link", "leg_l5_link")]:
+        ex = spec.add_exclude()
+        ex.bodyname1 = b1
+        ex.bodyname2 = b2
 
     # 关节阻尼/电枢 (接近真实电机特性, 可按需调整)
     # 注: 新版 MjSpec 中 damping/armature 为 per-dof 3向量
@@ -70,6 +108,10 @@ def main():
     xml = xml.replace('meshdir="../meshes/"', 'meshdir="../description/meshes/"')
     xml = re.sub(r'(<joint name="(?:leg|neck)_[^"]*"[^/>]*?)armature="0" damping="0 0 0"',
                  r'\1armature="0.01" damping="0.05"', xml)
+    # 剥掉除 base_link 外所有 link 的碰撞 mesh geom (无 contype=0 的那条):
+    # 全 mesh 碰撞会因坐姿双脚靠拢/摔倒贴身引发 mj_collideTree 深穿透栈爆炸.
+    # 碰撞仅保留 base_link(坐凳支撑) + 双脚 box + 凳子 + 地面.
+    xml = re.sub(r'\n\s*<geom type="mesh" rgba="[^"]*" mesh="(?!base_link")[^"]*"/>', '', xml)
     os.makedirs(os.path.dirname(XML_OUT), exist_ok=True)
     open(XML_OUT, "w").write(xml)
 

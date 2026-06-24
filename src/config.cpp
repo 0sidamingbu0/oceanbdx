@@ -6,6 +6,7 @@
 
 #include <yaml-cpp/yaml.h>
 #include <stdexcept>
+#include <sstream>
 
 namespace oceanbdx
 {
@@ -24,6 +25,29 @@ std::vector<T> GetVec(const YAML::Node &n, const std::string &key)
 {
     if (n[key]) return n[key].as<std::vector<T>>();
     return {};
+}
+
+template <typename T>
+void RequireSize(const std::vector<T> &v, size_t expected, const std::string &name)
+{
+    if (v.size() != expected)
+    {
+        std::ostringstream oss;
+        oss << name << " expects " << expected << " values, got " << v.size();
+        throw std::runtime_error(oss.str());
+    }
+}
+
+void RequireLegPort(const LegPortConfig &leg, const std::string &name)
+{
+    if (leg.motor_ids.empty()) throw std::runtime_error(name + ".motor_ids is empty");
+    if (leg.motor_ids.size() != leg.joint_indices.size())
+    {
+        std::ostringstream oss;
+        oss << name << " motor_ids/joint_indices size mismatch: "
+            << leg.motor_ids.size() << " vs " << leg.joint_indices.size();
+        throw std::runtime_error(oss.str());
+    }
 }
 } // namespace
 
@@ -133,6 +157,24 @@ Config Config::Load(const std::string &yaml_path)
     fill(c.joint_lower, -3.14);
     fill(c.joint_upper, 3.14);
     fill(c.default_dof_pos, 0.0);
+
+    const size_t nj = static_cast<size_t>(c.num_joints);
+    RequireLegPort(c.left_leg, "hardware.left_leg");
+    RequireLegPort(c.right_leg, "hardware.right_leg");
+    RequireSize(c.joint_names, nj, "joint_names");
+    RequireSize(c.directions, nj, "calibration.directions");
+    RequireSize(c.q_motor_offset, nj, "calibration.q_motor_offset");
+    RequireSize(c.urdf_offset, nj, "calibration.urdf_offset");
+    RequireSize(c.sit_pose, nj, "calibration.sit_pose");
+    RequireSize(c.stand_pose, nj, "calibration.stand_pose");
+    RequireSize(c.fixed_kp, nj, "control.fixed_kp");
+    RequireSize(c.fixed_kd, nj, "control.fixed_kd");
+    RequireSize(c.rl_kp, nj, "control.rl_kp");
+    RequireSize(c.rl_kd, nj, "control.rl_kd");
+    RequireSize(c.torque_limits, nj, "control.torque_limits");
+    RequireSize(c.joint_lower, nj, "control.joint_lower");
+    RequireSize(c.joint_upper, nj, "control.joint_upper");
+    RequireSize(c.default_dof_pos, nj, "policy.default_dof_pos");
 
     return c;
 }

@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <fcntl.h>
 #include <iostream>
@@ -35,6 +36,7 @@ using namespace oceanbdx;
 
 static std::atomic<bool> g_running{true};
 static std::atomic<int> g_event{static_cast<int>(FsmEvent::NONE)};
+static std::atomic<bool> g_selfcheck{false};
 static VelocityCommand g_cmd_vel;
 
 static void SignalHandler(int) { g_running = false; }
@@ -70,6 +72,7 @@ static void KeyboardLoop(const Config &cfg)
             case 'q': g_cmd_vel.wz = std::min(g_cmd_vel.wz.load() + 0.1, cfg.max_wz); break;
             case 'e': g_cmd_vel.wz = std::max(g_cmd_vel.wz.load() - 0.1, -cfg.max_wz); break;
             case 'x': g_cmd_vel.vx = 0; g_cmd_vel.vy = 0; g_cmd_vel.wz = 0; break;
+            case 'c': g_selfcheck = true; break;
             default: break;
             }
         }
@@ -119,13 +122,54 @@ int main(int argc, char **argv)
     // 关节 -> (腿, 腿内下标) 映射
     struct Map { LegDriver *leg; int idx; };
     std::vector<Map> jmap(cfg.num_joints, {nullptr, -1});
+    auto map_joint = [&](const char *leg_name, LegDriver *leg, int joint_index, int leg_index) {
+        if (joint_index < 0 || joint_index >= cfg.num_joints)
+        {
+            std::cerr << "invalid " << leg_name << " joint index " << joint_index << std::endl;
+            return false;
+        }
+        if (leg_index < 0 || leg_index >= leg->NumMotors())
+        {
+            std::cerr << "invalid " << leg_name << " motor slot " << leg_index << std::endl;
+            return false;
+        }
+        if (jmap[joint_index].leg != nullptr)
+        {
+            std::cerr << "duplicate joint mapping for index " << joint_index << std::endl;
+            return false;
+        }
+        jmap[joint_index] = {leg, leg_index};
+        return true;
+    };
+    bool mapping_ok = true;
     for (size_t k = 0; k < cfg.left_leg.joint_indices.size(); ++k)
-        jmap[cfg.left_leg.joint_indices[k]] = {&left, static_cast<int>(k)};
+        mapping_ok &= map_joint("left", &left, cfg.left_leg.joint_indices[k], static_cast<int>(k));
     for (size_t k = 0; k < cfg.right_leg.joint_indices.size(); ++k)
-        jmap[cfg.right_leg.joint_indices[k]] = {&right, static_cast<int>(k)};
+        mapping_ok &= map_joint("right", &right, cfg.right_leg.joint_indices[k], static_cast<int>(k));
+    for (int i = 0; i < cfg.num_joints; ++i)
+    {
+        if (jmap[i].leg == nullptr || jmap[i].idx < 0)
+        {
+            std::cerr << "invalid joint mapping for index " << i << " ("
+                      << (i < static_cast<int>(cfg.joint_names.size()) ? cfg.joint_names[i] : "?")
+                      << ")" << std::endl;
+            mapping_ok = false;
+        }
+    }
+    if (!mapping_ok)
+    {
+        g_running = false;
+        left.SetDamping(cfg.damping_kd);
+        right.SetDamping(cfg.damping_kd);
+        left.Stop();
+        right.Stop();
+        imu.Stop();
+        if (kb.joinable()) kb.join();
+        return -1;
+    }
 
     std::cout << "OceanBDX controller started. Keys: 0=boot 1=stand 2=walk "
-                 "3=balance 9=damp p=passive wsadqe=vel x=stop" << std::endl;
+                 "3=balance 9=damp p=passive wsadqe=vel x=stop c=selfcheck" << std::endl;
 
     auto next_tick = std::chrono::steady_clock::now();
     const auto period = std::chrono::microseconds(static_cast<long>(cfg.control_dt * 1e6));
@@ -161,7 +205,40 @@ int main(int argc, char **argv)
             jmap[i].leg->SetCommand(jmap[i].idx, mc);
         }
 
-        // 4. 状态打印 (1Hz)
+        // 4. 吊起自检 (按 'c' 触发一次): 静止吊平时检查 IMU 方向/gyro/关节偏差/策略量级。
+        //    判据: g≈(0,0,-1), gyro≈0, q-default≈0 时, act_absmax 应很小;
+        //    给机身一个倾角后, 看 g 的 x/y 分量符号与 policy 输出方向是否合理。
+        if (g_selfcheck.exchange(false))
+        {
+            auto g = PolicyRunner::ProjectedGravity(state.imu.quat);
+            double q_dev_absmax = 0.0, dq_absmax = 0.0;
+            for (int i = 0; i < cfg.num_joints; ++i)
+            {
+                q_dev_absmax = std::max(q_dev_absmax, std::fabs(state.joints[i].q - cfg.default_dof_pos[i]));
+                dq_absmax = std::max(dq_absmax, std::fabs(state.joints[i].dq));
+            }
+            double act_absmax = 0.0;
+            if (policy)
+                for (float a : policy->LastActions()) act_absmax = std::max(act_absmax, std::fabs(static_cast<double>(a)));
+
+            std::cout << "\n==== SELF CHECK [" << FsmStateName(fsm.State()) << "] ====" << std::endl;
+            std::cout << "  imu valid=" << (state.imu.valid ? "yes" : "NO")
+                      << "  hz=" << static_cast<int>(imu.UpdateHz()) << std::endl;
+            std::cout << "  projected_gravity=(" << g[0] << ", " << g[1] << ", " << g[2]
+                      << ")   [吊平静止应≈(0,0,-1)]" << std::endl;
+            std::cout << "  gyro(rad/s)=(" << state.imu.gyro[0] << ", " << state.imu.gyro[1]
+                      << ", " << state.imu.gyro[2] << ")   [静止应≈0]" << std::endl;
+            std::cout << "  q-default per joint:";
+            for (int i = 0; i < cfg.num_joints; ++i)
+                std::cout << " " << (state.joints[i].q - cfg.default_dof_pos[i]);
+            std::cout << std::endl;
+            std::cout << "  q_dev_absmax=" << q_dev_absmax << "  dq_absmax=" << dq_absmax
+                      << "  policy_act_absmax=" << act_absmax
+                      << (policy ? "" : " (no policy loaded)") << std::endl;
+            std::cout << "============================\n" << std::endl;
+        }
+
+        // 5. 状态打印 (1Hz)
         if (++print_count >= static_cast<int>(1.0 / cfg.control_dt))
         {
             print_count = 0;

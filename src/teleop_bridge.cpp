@@ -70,10 +70,48 @@ int main(int argc, char **argv)
     // 关节下标 -> (腿, 腿内下标)
     struct Map { LegDriver *leg; int idx; };
     std::vector<Map> jmap(nj, {nullptr, -1});
+    auto map_joint = [&](const char *leg_name, LegDriver *leg, int joint_index, int leg_index) {
+        if (joint_index < 0 || joint_index >= nj)
+        {
+            std::cerr << "[teleop] invalid " << leg_name << " joint index " << joint_index << std::endl;
+            return false;
+        }
+        if (leg_index < 0 || leg_index >= leg->NumMotors())
+        {
+            std::cerr << "[teleop] invalid " << leg_name << " motor slot " << leg_index << std::endl;
+            return false;
+        }
+        if (jmap[joint_index].leg != nullptr)
+        {
+            std::cerr << "[teleop] duplicate joint mapping for index " << joint_index << std::endl;
+            return false;
+        }
+        jmap[joint_index] = {leg, leg_index};
+        return true;
+    };
+    bool mapping_ok = true;
     for (size_t k = 0; k < cfg.left_leg.joint_indices.size(); ++k)
-        jmap[cfg.left_leg.joint_indices[k]] = {&left, static_cast<int>(k)};
+        mapping_ok &= map_joint("left", &left, cfg.left_leg.joint_indices[k], static_cast<int>(k));
     for (size_t k = 0; k < cfg.right_leg.joint_indices.size(); ++k)
-        jmap[cfg.right_leg.joint_indices[k]] = {&right, static_cast<int>(k)};
+        mapping_ok &= map_joint("right", &right, cfg.right_leg.joint_indices[k], static_cast<int>(k));
+    for (int i = 0; i < nj; ++i)
+    {
+        if (jmap[i].leg == nullptr || jmap[i].idx < 0)
+        {
+            std::cerr << "[teleop] invalid joint mapping for index " << i << " ("
+                      << (i < static_cast<int>(cfg.joint_names.size()) ? cfg.joint_names[i] : "?")
+                      << ")" << std::endl;
+            mapping_ok = false;
+        }
+    }
+    if (!mapping_ok)
+    {
+        left.SetDamping(cfg.damping_kd);
+        right.SetDamping(cfg.damping_kd);
+        left.Stop();
+        right.Stop();
+        return -1;
+    }
 
     // ---- UDP socket (本机回环) ----
     int sock = socket(AF_INET, SOCK_DGRAM, 0);

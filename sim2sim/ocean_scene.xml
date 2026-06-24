@@ -27,12 +27,9 @@
   </asset>
 
   <worldbody>
-    <geom name="floor" size="0 0 0.05" type="plane" friction="2.0 0.02 0.001"/>
+    <geom name="floor" size="0 0 0.05" type="plane" friction="2 0.02 0.001"/>
+    <geom name="stool" size="0.02 0.05 0.0512" pos="-0.105 0 0.0512" type="box" rgba="0.4 0.3 0.2 1"/>
     <light pos="0 0 3" dir="0 0 -1" type="directional"/>
-    <!-- 虚拟坐凳: 真实机器人坐姿靠底座支撑, 顶面z=0.1023 使坐姿(sit_pose)时双脚正好着地.
-         位于躯干底部后侧(x∈[-0.125,-0.085]), 与双脚(x>-0.075)留出间隙;
-         起立完成后由 mujoco_sim.py 下沉到地面以下避免绊脚 -->
-    <geom name="stool" type="box" size="0.02 0.05 0.0512" pos="-0.105 0 0.0512" rgba="0.4 0.3 0.2 1"/>
     <body name="base_link" pos="0 0 0.55">
       <inertial pos="0.033838 -0.0012004 -0.053283" quat="0.999794 0.00897417 0.0181415 0.00115492" mass="4.2921" diaginertia="0.0134027 0.0107175 0.00907378"/>
       <joint type="free" armature="0" damping="0 0 0"/>
@@ -59,8 +56,7 @@
                 <inertial pos="0.033054 -0.046256 -0.011541" quat="-0.145138 0.700527 -0.140909 0.684355" mass="0.45151" diaginertia="0.00143562 0.00129174 0.000240893"/>
                 <joint name="leg_r5_joint" pos="0 0 0" axis="0 0 -1" range="-1.396 1.134" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
                 <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r5_link"/>
-                <!-- 脚底碰撞: 等高box替代mesh (两脚STL底面差7~10mm会导致单脚支撑翻倒) -->
-                <geom name="foot_r" type="box" pos="0.0256 -0.0760 -0.0192" size="0.0921 0.0040 0.0145" friction="2.0 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
+                <geom name="foot_r" size="0.0921 0.004 0.0145" pos="0.0256 -0.076 -0.0192" type="box" friction="2 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
               </body>
             </body>
           </body>
@@ -86,8 +82,7 @@
                 <inertial pos="-0.034306 -0.042595 -0.010554" quat="-0.136962 0.683929 -0.141743 0.702418" mass="0.39976" diaginertia="0.00127757 0.00113059 0.000235971"/>
                 <joint name="leg_l5_joint" pos="0 0 0" axis="0 0 -1" range="-1.134 1.396" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
                 <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l5_link"/>
-                <!-- 脚底碰撞: 等高box替代mesh, 与foot_r底面同高 -->
-                <geom name="foot_l" type="box" pos="-0.0261 -0.0760 -0.0190" size="0.0926 0.0040 0.0149" friction="2.0 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
+                <geom name="foot_l" size="0.0926 0.004 0.0149" pos="-0.0261 -0.076 -0.019" type="box" friction="2 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
               </body>
             </body>
           </body>
@@ -116,12 +111,9 @@
     </body>
   </worldbody>
 
-  <!-- 碰撞体仅保留: base_link(坐凳), 双脚(leg_r5/leg_l5, 着地), 凳子, 地面.
-       排除剩余自碰撞对: 坐姿双脚靠拢, 摔倒时脚可能贴近躯干,
-       避免 mesh-mesh 深穿透引发 mj_collideTree 栈爆炸 -->
   <contact>
-    <exclude body1="leg_r5_link" body2="leg_l5_link"/>
     <exclude body1="base_link" body2="leg_r5_link"/>
     <exclude body1="base_link" body2="leg_l5_link"/>
+    <exclude body1="leg_r5_link" body2="leg_l5_link"/>
   </contact>
 </mujoco>
