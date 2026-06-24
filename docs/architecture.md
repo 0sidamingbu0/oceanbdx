@@ -163,6 +163,91 @@ PASSIVE ──0──▶ BOOT_CHECK ──通过──▶ SIT_HOLD ──1──
 
 第11步建议先吊起机器人空腿验证RL输出是否合理, 再落地。
 
+### 6.1 sim2sim kd 调试记录: 处理 IsaacLab 与 MuJoCo 不一致
+
+sim2sim 的主要风险不是 ONNX 推理本身, 而是 **IsaacLab implicit actuator** 与
+**MuJoCo 显式 torque PD** 的动力学差异。即使 policy 输出、观测顺序、关节顺序完全正确,
+统一的 `rl_kd` 也可能导致以下现象:
+
+- viewer 中站得住, 但零命令下缓慢横漂;
+- 给 `base_link` 施加外力后, policy 有动作响应, 脚也有离地/换支撑, 但单脚支撑后拉不回来;
+- 某个方向能小碎步恢复, 另一个方向变成抖动或侧翻;
+- action 长时间饱和, 例如 `final_sat=10/10`, 说明控制器已经进入极限响应。
+
+当前训练侧 actuator 配置为 `stiffness=50`, `damping=2.5`, `action_scale=0.25`。
+MuJoCo sim2sim 中保留训练动作幅度 `action_scale=0.25`, 但使用 sim2sim 专用逐关节阻尼:
+
+```yaml
+sim2sim:
+   action_scale: 0.25
+   rl_kd: [5.0, 4.0, 8.0, 8.0, 8.0,  5.0, 4.0, 8.0, 8.0, 8.0]
+```
+
+这组参数的含义:
+
+- `leg_*1` 髋部前后/根部关节: `kd=5`, 保留扰动恢复时的响应速度;
+- `leg_*2` 髋侧摆关节: `kd=4`, 避免侧向恢复被过强阻尼锁住;
+- `leg_*3/4/5` 大腿/小腿/踝相关关节: `kd=8`, 抑制 MuJoCo 显式 PD 下的高频摆腿和单脚支撑发散;
+- 这组只放在 `sim2sim` 段, 不影响 C++/真机侧 `control.rl_kd`。
+
+排查 sim2sim 不一致时, 先用 headless 固定外力测试, 不要只靠 viewer 目测:
+
+```bash
+# 0N 基线: 检查零命令自身漂移
+python3 sim2sim/mujoco_sim.py \
+   --debug-push-steps 112 \
+   --debug-push-start 80 \
+   --debug-push-duration 11 \
+   --debug-push-force-x 0 \
+   --debug-push-force-y 0
+
+# 侧向 40N, 约 0.16s: 对齐 IsaacLab play 中的抗推测试量级
+python3 sim2sim/mujoco_sim.py \
+   --debug-push-steps 112 \
+   --debug-push-start 80 \
+   --debug-push-duration 11 \
+   --debug-push-force-y 40
+
+# 前向 40N
+python3 sim2sim/mujoco_sim.py \
+   --debug-push-steps 112 \
+   --debug-push-start 80 \
+   --debug-push-duration 11 \
+   --debug-push-force-x 40 \
+   --debug-push-force-y 0
+```
+
+`[sim_push_summary]` 中重点看:
+
+- `final_vel_b`: 推力结束后一段时间的 body-frame 水平速度, 越接近 0 越好;
+- `final_tilt_xy`: 机身最终倾斜, 若接近 `0.5` 通常已经明显失稳;
+- `max_foot_z` 与 `air_steps`: 判断是否真的有抬脚/换支撑;
+- `final_sat`: action 饱和数量, 长期 `8/10` 到 `10/10` 说明参数仍偏激;
+- 0N 基线也要测, 因为某些 kd 对外力好, 但无外力会慢慢漂。
+
+本次调试中的关键对照:
+
+```text
+旧 sim2sim: action_scale=0.20, kd=8 all, +Y 40N
+   final_vel_y≈+0.889, final_tilt_y≈+0.519, final_sat=10/10
+   左脚长时间离地, 单脚支撑后发散。
+
+统一 kd=4 all, action_scale=0.25
+   侧向 40N 可以恢复, 但 +X 前向推会诱发明显侧倾。
+
+逐关节 kd=[5,4,8,8,8]*2, action_scale=0.25
+   0N / +Y / -Y / +X / -X 短测均未发散, 速度和姿态可回收。
+```
+
+迁移新 policy 或新 URDF 时建议按这个顺序排查:
+
+1. 先确认 ONNX 与 Isaac play 输出一致: 同一静态 obs 下 action 是否一致;
+2. 确认观测顺序、关节顺序、`default_dof_pos`、`action_scale` 与训练一致;
+3. 确认 IMU/projected_gravity 方向: 直立约 `[0,0,-1]`;
+4. 用 0N / ±Y / ±X 固定外力 headless 测试看 `final_vel_b` 和 `final_sat`;
+5. 若 policy 有明显动作但 MuJoCo 恢复失败, 优先调 sim2sim 专用 `rl_kd`;
+6. 统一 kd 不够时, 使用逐关节 kd: 髋部保留响应, 膝/踝增加阻尼。
+
 ## 7. IsaacLab 训练约定
 
 最小功能点: velocity 任务 (站立平衡 = 0速度指令, 行走 = 小速度指令)。

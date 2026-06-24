@@ -207,22 +207,32 @@ class Policy:
         self.default_dof_pos = np.array(cfg["default_dof_pos"], dtype=np.float32)
         self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 0.25]), dtype=np.float32)
         self.last_actions = np.zeros(self.nj, dtype=np.float32)
+        self.last_obs = None
+        self.last_projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self.last_raw_actions = np.zeros(self.nj, dtype=np.float32)
 
     def reset(self):
         self.last_actions[:] = 0
+        self.last_obs = None
+        self.last_projected_gravity[:] = [0.0, 0.0, -1.0]
+        self.last_raw_actions[:] = 0
 
     def step(self, q, dq, quat, gyro, cmd):
         c = self.cfg
+        projected_gravity = quat_rotate_inverse_gravity(quat)
         obs = np.concatenate([
             gyro * c["ang_vel_scale"],
-            quat_rotate_inverse_gravity(quat),
+            projected_gravity,
             np.asarray(cmd) * self.commands_scale,
             (q - self.default_dof_pos) * c["dof_pos_scale"],
             dq * c["dof_vel_scale"],
             self.last_actions,
         ]).astype(np.float32)
+        self.last_projected_gravity = projected_gravity.astype(np.float32)
         obs = np.clip(obs, -c["clip_obs"], c["clip_obs"])
+        self.last_obs = obs.copy()
         act = self.sess.run(None, {self.input_name: obs[None, :]})[0][0]
+        self.last_raw_actions = act.astype(np.float32)
         act = np.clip(act, -c["clip_actions"], c["clip_actions"])
         self.last_actions = act.astype(np.float32)
         return self.default_dof_pos + c["action_scale"] * act
@@ -246,6 +256,18 @@ class Sim:
         ctrl = full["control"]
         self.kp = np.array(ctrl["rl_kp"][:self.nj])
         self.kd = np.array(ctrl["rl_kd"][:self.nj])
+        sim2sim_ctrl = full.get("sim2sim", {})
+        if "rl_kp" in sim2sim_ctrl:
+            self.kp = np.array(sim2sim_ctrl["rl_kp"][:self.nj])
+        if "rl_kd" in sim2sim_ctrl:
+            self.kd = np.array(sim2sim_ctrl["rl_kd"][:self.nj])
+        if getattr(args, "sim_rl_kd", None) is not None:
+            self.kd = np.full(self.nj, float(args.sim_rl_kd))
+        if getattr(args, "sim_rl_kd_list", None):
+            values = [float(v) for v in args.sim_rl_kd_list.split(",")]
+            if len(values) != self.nj:
+                raise ValueError(f"--sim-rl-kd-list expects {self.nj} comma-separated values")
+            self.kd = np.array(values, dtype=float)
         self.fixed_kp = np.array(ctrl["fixed_kp"][:self.nj])
         self.fixed_kd = np.array(ctrl["fixed_kd"][:self.nj])
         self.tau_limit = np.array(ctrl["torque_limits"][:self.nj])
@@ -290,6 +312,11 @@ class Sim:
             if os.path.exists(pol_path):
                 pcfg = dict(full["policy"])
                 pcfg["default_dof_pos"] = pcfg["default_dof_pos"][:self.nj]
+                sim2sim_ctrl = full.get("sim2sim", {})
+                if "action_scale" in sim2sim_ctrl:
+                    pcfg["action_scale"] = sim2sim_ctrl["action_scale"]
+                if getattr(args, "sim_action_scale", None) is not None:
+                    pcfg["action_scale"] = float(args.sim_action_scale)
                 self.policy = Policy(pol_path, pcfg, self.nj)
                 print(f"[sim2sim] policy loaded: {pol_path}")
             else:
@@ -301,6 +328,23 @@ class Sim:
         self.rl_target = self.stand_pose.copy()
         self.rl_tick = 0
         self.stand_start = self.sit_pose.copy()
+        self.debug_obs = bool(getattr(args, "debug_obs", False))
+        self.debug_actions = bool(getattr(args, "debug_actions", False))
+        self.debug_actions_full = bool(getattr(args, "debug_actions_full", False))
+        self.debug_balance = bool(getattr(args, "debug_balance", False))
+        self.debug_obs_interval = float(getattr(args, "debug_obs_interval", 0.2))
+        self._last_debug_obs_time = -1.0e9
+        self.debug_push_steps = int(getattr(args, "debug_push_steps", 0))
+        self.debug_push_start = int(getattr(args, "debug_push_start", 80))
+        self.debug_push_duration = int(getattr(args, "debug_push_duration", 11))
+        self.debug_push_force = np.array([
+            float(getattr(args, "debug_push_force_x", 0.0)),
+            float(getattr(args, "debug_push_force_y", 40.0)),
+            0.0,
+        ], dtype=float)
+        self.debug_push_policy_step = 0
+        self.debug_push_base_body_id = self.model.body("base_link").id
+        self.debug_push_foot_geom_ids = [self.model.geom("foot_r").id, self.model.geom("foot_l").id]
 
         # 虚拟坐凳 (复刻真机底座): 坐姿时支撑躯干, 起立完成后下沉移除
         self.stool_gid = self.model.geom("stool").id
@@ -310,6 +354,33 @@ class Sim:
         self.sit_base_height = stool_top + 0.1853 + 0.001  # 1mm 余量
 
         self.reset()
+
+    def probe_policy(self):
+        if not self.policy:
+            print("[probe_policy] policy is not loaded")
+            return
+        q = self.stand_pose.copy()
+        dq = np.zeros(self.nj, dtype=np.float32)
+        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        gyro = np.zeros(3, dtype=np.float32)
+        cmd = np.zeros(3, dtype=np.float32)
+        target = self.policy.step(q, dq, quat, gyro, cmd)
+        action = self.policy.last_actions
+        raw_action = self.policy.last_raw_actions
+        saturated = [LEG_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
+        active = np.argsort(-np.abs(action))[:4]
+        active_text = ", ".join(f"{LEG_JOINTS[i]}={action[i]:+.3f}" for i in active)
+        saturated_text = ",".join(saturated) if saturated else "none"
+        print(
+            "[probe_policy] ideal_zero_stand "
+            f"act_absmax={np.max(np.abs(action)):.3f} "
+            f"raw_act_absmax={np.max(np.abs(raw_action)):.3f} "
+            f"target_absmax={np.max(np.abs(target)):.3f} "
+            f"sat_count={len(saturated)}/{self.nj}"
+        )
+        print(f"[probe_policy] top=[{active_text}] saturated=[{saturated_text}]")
+        print(f"[probe_policy] raw_action={np.array2string(raw_action, precision=3, floatmode='fixed', separator=', ')}")
+        print(f"[probe_policy] target={np.array2string(target, precision=3, floatmode='fixed', separator=', ')}")
 
     def _remove_stool(self):
         """起立完成后将凳子沉入地下, 避免行走时绊脚"""
@@ -342,6 +413,213 @@ class Sim:
         quat = self.data.qpos[3:7].copy()  # freejoint四元数 (w,x,y,z)
         gyro = self.data.qvel[3:6].copy()  # MuJoCo freejoint qvel[3:6] 即机体系角速度
         return q, dq, quat, gyro
+
+    def debug_print_obs(self, q, dq, quat, gyro, target):
+        if not self.debug_obs:
+            return
+        now = self.data.time
+        if now - self._last_debug_obs_time < self.debug_obs_interval:
+            return
+        self._last_debug_obs_time = now
+
+        projected_gravity = quat_rotate_inverse_gravity(quat)
+        if self.policy:
+            raw_action = self.policy.last_raw_actions
+            action = self.policy.last_actions
+            obs = self.policy.last_obs
+            obs_min = float(np.min(obs)) if obs is not None else 0.0
+            obs_max = float(np.max(obs)) if obs is not None else 0.0
+        else:
+            raw_action = np.zeros(self.nj)
+            action = np.zeros(self.nj)
+            obs_min = 0.0
+            obs_max = 0.0
+
+        print(
+            "[debug_obs] "
+            f"t={now:7.3f} state={self.state:10s} "
+            f"q_abs={np.max(np.abs(q)):.3f} dq_abs={np.max(np.abs(dq)):.3f} "
+            f"act_absmax={np.max(np.abs(action)):.3f} raw_act_absmax={np.max(np.abs(raw_action)):.3f} "
+            f"target_absmax={np.max(np.abs(target)):.3f} obs_range=[{obs_min:+.3f},{obs_max:+.3f}]"
+        )
+
+        if self.debug_balance:
+            left_force, right_force = self.foot_contact_forces()
+            lin_vel_w, lin_vel_b = self.base_linear_velocities()
+            print(
+                "[debug_balance] "
+                f"base_xy=[{self.data.qpos[0]:+.3f},{self.data.qpos[1]:+.3f}] "
+                f"base_z={self.data.qpos[2]:+.3f} "
+                f"vel_b=[{lin_vel_b[0]:+.3f},{lin_vel_b[1]:+.3f},{lin_vel_b[2]:+.3f}] "
+                f"vel_w=[{lin_vel_w[0]:+.3f},{lin_vel_w[1]:+.3f},{lin_vel_w[2]:+.3f}] "
+                f"tilt_xy=[{projected_gravity[0]:+.3f},{projected_gravity[1]:+.3f}] "
+                f"feet_fz=[L:{left_force:.1f},R:{right_force:.1f}] "
+                f"feet_balance={left_force - right_force:+.1f}"
+            )
+
+        if self.debug_actions:
+            active = np.argsort(-np.abs(action))[:4]
+            active_text = ", ".join(
+                f"{LEG_JOINTS[i]}={action[i]:+.3f}" for i in active
+            )
+            saturated = [LEG_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
+            saturated_text = ",".join(saturated) if saturated else "none"
+            print(
+                "[debug_action_summary] "
+                f"top=[{active_text}] saturated=[{saturated_text}] "
+                f"sat_count={len(saturated)}/{self.nj}"
+            )
+            if self.debug_actions_full:
+                print(
+                    "[debug_action_detail] "
+                    f"raw_action={np.array2string(raw_action, precision=3, floatmode='fixed', separator=', ')} "
+                    f"q={np.array2string(q, precision=3, floatmode='fixed', separator=', ')} "
+                    f"dq={np.array2string(dq, precision=3, floatmode='fixed', separator=', ')} "
+                    f"action={np.array2string(action, precision=3, floatmode='fixed', separator=', ')} "
+                    f"target={np.array2string(target, precision=3, floatmode='fixed', separator=', ')}"
+                )
+
+    def base_linear_velocities(self):
+        lin_vel_w = self.data.qvel[0:3].copy()
+        base_body_id = self.model.body("base_link").id
+        rot_wb = self.data.xmat[base_body_id].reshape(3, 3)
+        lin_vel_b = rot_wb.T @ lin_vel_w
+        return lin_vel_w, lin_vel_b
+
+    def foot_contact_forces(self):
+        left_force = 0.0
+        right_force = 0.0
+        try:
+            left_gid = self.model.geom("foot_l").id
+            right_gid = self.model.geom("foot_r").id
+        except KeyError:
+            return left_force, right_force
+        force = np.zeros(6)
+        for contact_index in range(self.data.ncon):
+            contact = self.data.contact[contact_index]
+            if contact.geom1 not in (left_gid, right_gid) and contact.geom2 not in (left_gid, right_gid):
+                continue
+            mujoco.mj_contactForce(self.model, self.data, contact_index, force)
+            normal_force = max(0.0, float(force[0]))
+            if contact.geom1 == left_gid or contact.geom2 == left_gid:
+                left_force += normal_force
+            if contact.geom1 == right_gid or contact.geom2 == right_gid:
+                right_force += normal_force
+        return left_force, right_force
+
+    def foot_geom_heights(self):
+        return [float(self.data.geom_xpos[gid, 2]) for gid in self.debug_push_foot_geom_ids]
+
+    def _print_debug_push(self, step, active, force_w, q, dq, target):
+        lin_vel_w, lin_vel_b = self.base_linear_velocities()
+        gravity_b = quat_rotate_inverse_gravity(self.data.qpos[3:7])
+        left_force, right_force = self.foot_contact_forces()
+        action = self.policy.last_actions if self.policy else np.zeros(self.nj)
+        raw_action = self.policy.last_raw_actions if self.policy else np.zeros(self.nj)
+        print(
+            "[sim_push] "
+            f"step={step} active={int(active)} "
+            f"force_w=[{force_w[0]:+.1f},{force_w[1]:+.1f},{force_w[2]:+.1f}] "
+            f"base_pos={np.round(self.data.qpos[0:3], 3).tolist()} "
+            f"lin_vel_b={np.round(lin_vel_b, 3).tolist()} "
+            f"lin_vel_w={np.round(lin_vel_w, 3).tolist()} "
+            f"grav_b={np.round(gravity_b, 3).tolist()} "
+            f"feet_fz=[R:{right_force:.1f},L:{left_force:.1f}] "
+            f"foot_z={np.round(self.foot_geom_heights(), 3).tolist()} "
+            f"q={np.round(q, 3).tolist()} "
+            f"dq={np.round(dq, 3).tolist()} "
+            f"action={np.round(action, 3).tolist()} "
+            f"raw_action={np.round(raw_action, 3).tolist()} "
+            f"target={np.round(target, 3).tolist()}"
+        )
+
+    def run_debug_push(self):
+        if not self.policy:
+            print("[sim_push] policy is not loaded; abort")
+            return
+        sim_steps_per_ctrl = max(1, int(round(self.control_dt / self.model.opt.timestep)))
+        print(
+            "[sim_push] "
+            f"force_w={self.debug_push_force.tolist()}N "
+            f"start={self.debug_push_start} duration={self.debug_push_duration} "
+            f"steps={self.debug_push_steps} sim_dt={self.model.opt.timestep} control_dt={self.control_dt} "
+            f"decimation={self.decimation} action_scale={self.policy.cfg['action_scale']} kd={np.round(self.kd, 3).tolist()}"
+        )
+        self.stand_start = self.data.qpos[self.q_adr].copy()
+        self.state, self.state_time = "STAND_UP", 0.0
+        print("[sim_push] auto SIT -> STAND_UP")
+
+        self.debug_push_policy_step = 0
+        last_policy_tick = -1
+        samples = []
+        while self.debug_push_policy_step < self.debug_push_steps:
+            tau, neck_tau = self.control_step()
+            in_rl = self.state in ("RL_BALANCE", "RL_WALK")
+            is_policy_tick = in_rl and self.policy and self.rl_tick != last_policy_tick and ((self.rl_tick - 1) % self.decimation == 0)
+            active = in_rl and self.debug_push_start <= self.debug_push_policy_step < self.debug_push_start + self.debug_push_duration
+            if is_policy_tick:
+                last_policy_tick = self.rl_tick
+                step = self.debug_push_policy_step
+                force_w = self.debug_push_force if active else np.zeros(3)
+                q, dq, _, _ = self.get_obs_raw()
+                should_print = active or step % 10 == 0
+                lin_vel_w, lin_vel_b = self.base_linear_velocities()
+                left_force, right_force = self.foot_contact_forces()
+                foot_z = self.foot_geom_heights()
+                samples.append({
+                    "step": step,
+                    "active": active,
+                    "base_x": float(self.data.qpos[0]),
+                    "base_y": float(self.data.qpos[1]),
+                    "base_z": float(self.data.qpos[2]),
+                    "vel_x": float(lin_vel_b[0]),
+                    "vel_y": float(lin_vel_b[1]),
+                    "tilt_x": float(quat_rotate_inverse_gravity(self.data.qpos[3:7])[0]),
+                    "tilt_y": float(quat_rotate_inverse_gravity(self.data.qpos[3:7])[1]),
+                    "right_fz": float(right_force),
+                    "left_fz": float(left_force),
+                    "right_z": float(foot_z[0]),
+                    "left_z": float(foot_z[1]),
+                    "act_absmax": float(np.max(np.abs(self.policy.last_actions))),
+                    "sat_count": int(np.sum(np.abs(self.policy.last_actions) > 0.98)),
+                })
+                if should_print:
+                    self._print_debug_push(step, active, force_w, q, dq, self.rl_target)
+                self.debug_push_policy_step += 1
+
+            for _ in range(sim_steps_per_ctrl):
+                self.data.qfrc_applied[:] = 0.0
+                self.data.xfrc_applied[:] = 0.0
+                self.data.qfrc_applied[self.v_adr] = tau
+                self.data.qfrc_applied[self.neck_v_adr] = neck_tau
+                if active:
+                    self.data.xfrc_applied[self.debug_push_base_body_id, 0:3] = self.debug_push_force
+                mujoco.mj_step(self.model, self.data)
+
+        if samples:
+            final = samples[-1]
+            max_abs_vel_x = max(abs(s["vel_x"]) for s in samples)
+            max_abs_vel_y = max(abs(s["vel_y"]) for s in samples)
+            max_left_z = max(s["left_z"] for s in samples)
+            max_right_z = max(s["right_z"] for s in samples)
+            left_air_steps = sum(1 for s in samples if s["left_fz"] < 1.0)
+            right_air_steps = sum(1 for s in samples if s["right_fz"] < 1.0)
+            active_samples = [s for s in samples if s["active"]]
+            peak_push_vel_x = max((abs(s["vel_x"]) for s in active_samples), default=0.0)
+            peak_push_vel_y = max((abs(s["vel_y"]) for s in active_samples), default=0.0)
+            print(
+                "[sim_push_summary] "
+                f"action_scale={self.policy.cfg['action_scale']:.3f} kd={np.round(self.kd, 3).tolist()} "
+                f"final_step={final['step']} final_xy=[{final['base_x']:+.3f},{final['base_y']:+.3f}] "
+                f"final_z={final['base_z']:+.3f} "
+                f"final_vel_b=[{final['vel_x']:+.3f},{final['vel_y']:+.3f}] "
+                f"final_tilt_xy=[{final['tilt_x']:+.3f},{final['tilt_y']:+.3f}] "
+                f"max_abs_vel_b=[{max_abs_vel_x:.3f},{max_abs_vel_y:.3f}] "
+                f"peak_push_abs_vel_b=[{peak_push_vel_x:.3f},{peak_push_vel_y:.3f}] "
+                f"max_foot_z=[R:{max_right_z:.3f},L:{max_left_z:.3f}] "
+                f"air_steps=[R:{right_air_steps},L:{left_air_steps}] "
+                f"final_sat={final['sat_count']}/{self.nj}"
+            )
 
     def key_cb(self, keycode):
         c = chr(keycode) if keycode < 256 else ""
@@ -514,6 +792,8 @@ class Sim:
         else:  # DAMPING
             target, kp, kd = q, np.zeros(self.nj), np.full(self.nj, self.damping_kd)
 
+        self.debug_print_obs(q, dq, quat, gyro, target)
+
         self.last_target = target.copy()
         self.last_kp = kp.copy()
         self.last_kd = kd.copy()
@@ -608,6 +888,10 @@ class Sim:
             panel.close()
 
     def run(self):
+        if getattr(self, "probe_policy_only", False):
+            return self.probe_policy()
+        if self.debug_push_steps:
+            return self.run_debug_push()
         if self.want_manual:
             return self._run_teleop()
         sim_steps_per_ctrl = max(1, int(round(self.control_dt / self.model.opt.timestep)))
@@ -658,9 +942,39 @@ if __name__ == "__main__":
                     help="连接真机电机: 普通sim2sim中输出仿真目标角; 与 --manual 组合时为滑块联调")
     ap.add_argument("--manual", action="store_true",
                     help="打开关节角拖动滑块面板 (可与 --real 组合)")
+    ap.add_argument("--debug-obs", action="store_true",
+                    help="打印base姿态/IMU等效观测/policy动作, 用于检查sim2sim坐标系")
+    ap.add_argument("--debug-actions", action="store_true",
+                    help="配合--debug-obs打印每个关节的raw action/action/target/q/dq")
+    ap.add_argument("--debug-actions-full", action="store_true",
+                    help="配合--debug-actions打印完整raw action/action/target/q/dq数组")
+    ap.add_argument("--debug-balance", action="store_true",
+                    help="配合--debug-obs打印base倾斜/横移和左右脚接触力")
+    ap.add_argument("--debug-obs-interval", type=float, default=0.2,
+                    help="--debug-obs的打印间隔(s), 默认0.2")
+    ap.add_argument("--probe-policy", action="store_true",
+                    help="不启动viewer, 用理想零位直立观测直接测试ONNX策略输出")
+    ap.add_argument("--debug-push-steps", type=int, default=0,
+                    help="不启动viewer, 自动起立后在RL_BALANCE中运行固定外力测试, 单位为policy step")
+    ap.add_argument("--debug-push-start", type=int, default=80,
+                    help="固定外力开始的policy step, 从进入RL_BALANCE后计数")
+    ap.add_argument("--debug-push-duration", type=int, default=11,
+                    help="固定外力持续的policy step")
+    ap.add_argument("--debug-push-force-x", type=float, default=0.0,
+                    help="固定外力世界系X方向[N]")
+    ap.add_argument("--debug-push-force-y", type=float, default=40.0,
+                    help="固定外力世界系Y方向[N]")
+    ap.add_argument("--sim-action-scale", type=float, default=None,
+                    help="仅本次sim2sim运行覆盖policy action_scale")
+    ap.add_argument("--sim-rl-kd", type=float, default=None,
+                    help="仅本次sim2sim运行覆盖所有腿部RL kd")
+    ap.add_argument("--sim-rl-kd-list", default=None,
+                    help="仅本次sim2sim运行覆盖逐关节RL kd, 10个逗号分隔数值")
     args = ap.parse_args()
 
     if not os.path.exists(SCENE_XML):
         print("scene xml missing, run: python3 scripts/urdf2mjcf.py")
         sys.exit(1)
-    Sim(args).run()
+    sim = Sim(args)
+    sim.probe_policy_only = args.probe_policy
+    sim.run()

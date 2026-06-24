@@ -66,6 +66,8 @@ python3 sim2sim/mujoco_sim.py --no-policy     # 仅验证起立脚本
 python3 sim2sim/mujoco_sim.py                 # 加载 policy/policy.onnx 完整验证
 ```
 
+sim2sim 与 IsaacLab 不一致时, 尤其是外力后单脚支撑发散、横漂或动作饱和, 先看 [docs/architecture.md](docs/architecture.md) 的 “sim2sim kd 调试记录”。
+
 ### 真机运行
 
 ```bash

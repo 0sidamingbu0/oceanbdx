@@ -27,7 +27,7 @@
   </asset>
 
   <worldbody>
-    <geom name="floor" size="0 0 0.05" type="plane"/>
+    <geom name="floor" size="0 0 0.05" type="plane" friction="2.0 0.02 0.001"/>
     <light pos="0 0 3" dir="0 0 -1" type="directional"/>
     <!-- 虚拟坐凳: 真实机器人坐姿靠底座支撑, 顶面z=0.1023 使坐姿(sit_pose)时双脚正好着地.
          位于躯干底部后侧(x∈[-0.125,-0.085]), 与双脚(x>-0.075)留出间隙;
@@ -60,7 +60,7 @@
                 <joint name="leg_r5_joint" pos="0 0 0" axis="0 0 -1" range="-1.396 1.134" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
                 <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_r5_link"/>
                 <!-- 脚底碰撞: 等高box替代mesh (两脚STL底面差7~10mm会导致单脚支撑翻倒) -->
-                <geom name="foot_r" type="box" pos="0.0256 -0.0760 -0.0192" size="0.0921 0.0040 0.0145" rgba="0.8 0.2 0.2 0.3"/>
+                <geom name="foot_r" type="box" pos="0.0256 -0.0760 -0.0192" size="0.0921 0.0040 0.0145" friction="2.0 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
               </body>
             </body>
           </body>
@@ -87,7 +87,7 @@
                 <joint name="leg_l5_joint" pos="0 0 0" axis="0 0 -1" range="-1.134 1.396" actuatorfrcrange="-100 100" armature="0.01" damping="0.05"/>
                 <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l5_link"/>
                 <!-- 脚底碰撞: 等高box替代mesh, 与foot_r底面同高 -->
-                <geom name="foot_l" type="box" pos="-0.0261 -0.0760 -0.0190" size="0.0926 0.0040 0.0149" rgba="0.8 0.2 0.2 0.3"/>
+                <geom name="foot_l" type="box" pos="-0.0261 -0.0760 -0.0190" size="0.0926 0.0040 0.0149" friction="2.0 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
               </body>
             </body>
           </body>

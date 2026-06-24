@@ -65,7 +65,7 @@ oceanbdx:
 
   control:
     dt: 0.005                  # 主控制周期 200Hz
-    decimation: 4              # 策略周期 = 0.005*4 = 50Hz
+    decimation: 3              # 策略周期 = 0.005*3 = 66.7Hz, 接近训练60Hz
     fixed_kp: [50, 50, 50, 50, 50,  50, 50, 50, 50, 50]   # 脚本模式 (坐姿保持/起立)
     fixed_kd: [3, 3, 3, 3, 3,  3, 3, 3, 3, 3]
     rl_kp:    [50, 50, 50, 50, 50,  50, 50, 50, 50, 50]   # RL模式 (须与训练一致)
@@ -87,7 +87,7 @@ oceanbdx:
     dof_pos_scale: 1.0
     dof_vel_scale: 0.05
     action_scale: 0.25
-    clip_actions: 100.0
+    clip_actions: 1.0          # IsaacLab训练侧在env内将action裁剪到[-1, 1]
     clip_obs: 100.0
     commands_scale: [2.0, 2.0, 0.25]
     # 策略的 default joint pos (训练时 init_state.joint_pos), 站立姿态为全0
@@ -97,6 +97,15 @@ oceanbdx:
     max_vx: 0.5
     max_vy: 0.3
     max_wz: 0.8
+
+  # ---- MuJoCo sim2sim 专用覆盖 ----
+  # Isaac Lab 训练使用 implicit actuator，MuJoCo 这里用显式 torque PD。
+  # 同样的 kd=2.5 在 MuJoCo 中阻尼偏小，会导致 RL 接管后抖动摔倒；
+  # 逐关节阻尼用于兼顾侧向抗推和前后抗推：髋部保留一定响应，膝/踝增加阻尼。
+  # 这里只覆盖 sim2sim，不影响 C++/真机侧 control.rl_kd。
+  sim2sim:
+    action_scale: 0.25
+    rl_kd: [5.0, 4.0, 8.0, 8.0, 8.0,  5.0, 4.0, 8.0, 8.0, 8.0]
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机

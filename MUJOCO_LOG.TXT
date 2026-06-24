@@ -10,3 +10,7 @@ ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
 Tue Jun 16 11:09:51 2026
 ERROR: mj_copyDataVisual: attempting to copy mjData while stack is in use
 
+WARNING Tue Jun 23 20:31:11 2026: Nan, Inf or huge value in QPOS at DOF 0. The simulation is unstable. Time = 0.0010.
+
+ERROR mj_copyDataVisual (engine_io.c:1162) Tue Jun 23 20:31:11 2026: attempting to copy mjData while stack is in use
+
