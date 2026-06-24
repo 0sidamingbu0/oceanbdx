@@ -114,6 +114,8 @@ Config Config::Load(const std::string &yaml_path)
         c.joint_upper = GetVec<double>(ctrl, "joint_upper");
         c.sit_align_duration = Get<double>(ctrl, "sit_align_duration", 3.0);
         c.stand_duration = Get<double>(ctrl, "stand_duration", 3.0);
+        c.rl_warmup_duration = Get<double>(ctrl, "rl_warmup_duration", 2.0);
+        c.rl_target_rate_limit = Get<double>(ctrl, "rl_target_rate_limit", 2.0);
         c.damping_kd = Get<double>(ctrl, "damping_kd", 2.0);
     }
 

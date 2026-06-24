@@ -260,6 +260,10 @@ int main(int argc, char **argv)
             std::cout << "  q_dev_absmax=" << q_dev_absmax << "  dq_absmax=" << dq_absmax
                       << "  policy_act_absmax=" << act_absmax
                       << (policy ? "" : " (no policy loaded)") << std::endl;
+            std::cout << "  policy_path=" << (cfg.policy_path.empty() ? "<empty>" : cfg.policy_path)
+                      << "  action_scale=" << cfg.action_scale
+                      << "  rl_target_rate_limit=" << cfg.rl_target_rate_limit
+                      << "  rl_warmup_duration=" << cfg.rl_warmup_duration << std::endl;
             std::cout << "============================\n" << std::endl;
         }
 

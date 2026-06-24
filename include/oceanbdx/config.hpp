@@ -62,6 +62,8 @@ struct Config
     std::vector<double> joint_upper;
     double sit_align_duration = 3.0;           // 上电回蹲姿脚本时长 (s)
     double stand_duration = 3.0;               // 起立脚本时长 (s)
+    double rl_warmup_duration = 2.0;           // RL接管时动作逐渐放大时长 (s)
+    double rl_target_rate_limit = 2.0;         // RL目标角最大变化率 (rad/s, <=0关闭)
     double damping_kd = 2.0;                   // 阻尼保护模式 kd
 
     // ---- 策略 ----

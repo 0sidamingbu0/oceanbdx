@@ -232,7 +232,22 @@ std::vector<JointCommand> Fsm::DoRl(const RobotState &s, const std::array<double
             q[i] = s.joints[i].q;
             dq[i] = s.joints[i].dq;
         }
-        rl_target_ = policy_->Step(q, dq, s.imu.quat, s.imu.gyro, cmd);
+        auto policy_target = policy_->Step(q, dq, s.imu.quat, s.imu.gyro, cmd);
+        double warmup = 1.0;
+        if (cfg_.rl_warmup_duration > 0.0)
+        {
+            warmup = std::min(state_time_ / cfg_.rl_warmup_duration, 1.0);
+            warmup = 0.5 * (1.0 - std::cos(M_PI * warmup));
+        }
+
+        const double max_step = cfg_.rl_target_rate_limit * cfg_.control_dt * cfg_.decimation;
+        for (int i = 0; i < cfg_.num_joints; ++i)
+        {
+            double desired = cfg_.stand_pose[i] + warmup * (policy_target[i] - cfg_.stand_pose[i]);
+            if (cfg_.rl_target_rate_limit > 0.0)
+                desired = rl_target_[i] + std::min(std::max(desired - rl_target_[i], -max_step), max_step);
+            rl_target_[i] = desired;
+        }
     }
 
     std::vector<JointCommand> cmds(cfg_.num_joints);
