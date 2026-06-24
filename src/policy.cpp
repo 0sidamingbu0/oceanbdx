@@ -26,6 +26,7 @@ struct PolicyRunner::Impl
 PolicyRunner::PolicyRunner(const Config &cfg) : cfg_(cfg), impl_(new Impl())
 {
     last_actions_.assign(cfg_.num_joints, 0.0f);
+    last_raw_actions_.assign(cfg_.num_joints, 0.0f);
 }
 
 PolicyRunner::~PolicyRunner() = default;
@@ -56,6 +57,7 @@ bool PolicyRunner::Load()
 void PolicyRunner::Reset()
 {
     std::fill(last_actions_.begin(), last_actions_.end(), 0.0f);
+    std::fill(last_raw_actions_.begin(), last_raw_actions_.end(), 0.0f);
 }
 
 std::array<double, 3> PolicyRunner::ProjectedGravity(const std::array<double, 4> &q)
@@ -122,6 +124,7 @@ std::vector<double> PolicyRunner::Step(const std::vector<double> &q,
     std::vector<double> target(nj);
     for (int i = 0; i < nj; ++i)
     {
+        last_raw_actions_[i] = act[i];
         float a = std::min(std::max(act[i], -ca), ca);
         last_actions_[i] = a;
         target[i] = cfg_.default_dof_pos[i] + cfg_.action_scale * a;

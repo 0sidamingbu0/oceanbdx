@@ -27,6 +27,7 @@
 #include <cmath>
 #include <csignal>
 #include <filesystem>
+#include <iomanip>
 #include <fcntl.h>
 #include <iostream>
 #include <termios.h>
@@ -133,6 +134,29 @@ int main(int argc, char **argv)
         {
             std::cerr << "policy load failed, RL states disabled" << std::endl;
             policy.reset();
+        }
+        else
+        {
+            std::vector<double> q = cfg.default_dof_pos;
+            std::vector<double> dq(cfg.num_joints, 0.0);
+            std::array<double, 4> quat{1.0, 0.0, 0.0, 0.0};
+            std::array<double, 3> gyro{0.0, 0.0, 0.0};
+            std::array<double, 3> cmd{0.0, 0.0, 0.0};
+            policy->Step(q, dq, quat, gyro, cmd);
+            double act_absmax = 0.0, raw_absmax = 0.0;
+            int sat_count = 0;
+            for (int i = 0; i < cfg.num_joints; ++i)
+            {
+                double a = std::fabs(static_cast<double>(policy->LastActions()[i]));
+                double raw = std::fabs(static_cast<double>(policy->LastRawActions()[i]));
+                act_absmax = std::max(act_absmax, a);
+                raw_absmax = std::max(raw_absmax, raw);
+                if (a > 0.98) ++sat_count;
+            }
+            std::cout << "[Policy] zero-stand probe: act_absmax=" << act_absmax
+                      << " raw_act_absmax=" << raw_absmax
+                      << " saturated=" << sat_count << "/" << cfg.num_joints << std::endl;
+            policy->Reset();
         }
     }
 
@@ -243,8 +267,14 @@ int main(int argc, char **argv)
                 dq_absmax = std::max(dq_absmax, std::fabs(state.joints[i].dq));
             }
             double act_absmax = 0.0;
+            double raw_act_absmax = 0.0;
             if (policy)
-                for (float a : policy->LastActions()) act_absmax = std::max(act_absmax, std::fabs(static_cast<double>(a)));
+            {
+                for (float a : policy->LastActions())
+                    act_absmax = std::max(act_absmax, std::fabs(static_cast<double>(a)));
+                for (float a : policy->LastRawActions())
+                    raw_act_absmax = std::max(raw_act_absmax, std::fabs(static_cast<double>(a)));
+            }
 
             std::cout << "\n==== SELF CHECK [" << FsmStateName(fsm.State()) << "] ====" << std::endl;
             std::cout << "  imu valid=" << (state.imu.valid ? "yes" : "NO")
@@ -259,7 +289,28 @@ int main(int argc, char **argv)
             std::cout << std::endl;
             std::cout << "  q_dev_absmax=" << q_dev_absmax << "  dq_absmax=" << dq_absmax
                       << "  policy_act_absmax=" << act_absmax
+                      << "  raw_act_absmax=" << raw_act_absmax
                       << (policy ? "" : " (no policy loaded)") << std::endl;
+            if (policy)
+            {
+                std::cout << "  action:";
+                for (int i = 0; i < cfg.num_joints; ++i)
+                    std::cout << " " << std::fixed << std::setprecision(3) << policy->LastActions()[i];
+                std::cout << std::defaultfloat << std::endl;
+                std::cout << "  raw_action:";
+                for (int i = 0; i < cfg.num_joints; ++i)
+                    std::cout << " " << std::fixed << std::setprecision(3) << policy->LastRawActions()[i];
+                std::cout << std::defaultfloat << std::endl;
+            }
+            std::cout << "  rl_target:";
+            for (int i = 0; i < cfg.num_joints; ++i)
+                std::cout << " " << std::fixed << std::setprecision(3) << fsm.RlTarget()[i];
+            std::cout << std::defaultfloat << std::endl;
+            std::cout << "  target-q:";
+            for (int i = 0; i < cfg.num_joints; ++i)
+                std::cout << " " << std::fixed << std::setprecision(3)
+                          << (fsm.RlTarget()[i] - state.joints[i].q);
+            std::cout << std::defaultfloat << std::endl;
             std::cout << "  policy_path=" << (cfg.policy_path.empty() ? "<empty>" : cfg.policy_path)
                       << "  action_scale=" << cfg.action_scale
                       << "  rl_target_rate_limit=" << cfg.rl_target_rate_limit

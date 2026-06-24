@@ -41,6 +41,7 @@ public:
                              const std::array<double, 3> &cmd);
 
     const std::vector<float> &LastActions() const { return last_actions_; }
+    const std::vector<float> &LastRawActions() const { return last_raw_actions_; }
 
     // 工具: 四元数(w,x,y,z)旋转重力向量到机体系
     static std::array<double, 3> ProjectedGravity(const std::array<double, 4> &quat);
@@ -48,6 +49,7 @@ public:
 private:
     Config cfg_;
     std::vector<float> last_actions_;
+    std::vector<float> last_raw_actions_;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

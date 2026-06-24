@@ -69,6 +69,7 @@ public:
 
     FsmState State() const { return state_; }
     const std::string &Message() const { return message_; }
+    const std::vector<double> &RlTarget() const { return rl_target_; }
 
 private:
     void Transit(FsmState next);
