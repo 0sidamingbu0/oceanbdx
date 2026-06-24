@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <filesystem>
 #include <fcntl.h>
 #include <iostream>
 #include <termios.h>
@@ -40,6 +41,29 @@ static std::atomic<bool> g_selfcheck{false};
 static VelocityCommand g_cmd_vel;
 
 static void SignalHandler(int) { g_running = false; }
+
+static std::string ResolvePolicyPath(const std::string &config_path, const std::string &policy_path)
+{
+    namespace fs = std::filesystem;
+    if (policy_path.empty()) return policy_path;
+
+    fs::path path(policy_path);
+    if (path.is_absolute() || fs::exists(path)) return policy_path;
+
+    fs::path cfg_dir = fs::path(config_path).parent_path();
+    if (cfg_dir.empty()) cfg_dir = ".";
+
+    // Config files live under config/, while policy paths are written relative to the repo root.
+    fs::path repo_relative = cfg_dir / ".." / path;
+    if (fs::exists(repo_relative))
+    {
+        std::cout << "[Policy] resolved " << policy_path << " -> " << repo_relative.lexically_normal().string()
+                  << std::endl;
+        return repo_relative.lexically_normal().string();
+    }
+
+    return policy_path;
+}
 
 static void KeyboardLoop(const Config &cfg)
 {
@@ -85,6 +109,7 @@ int main(int argc, char **argv)
 {
     std::string config_path = (argc > 1) ? argv[1] : "config/oceanbdx.yaml";
     Config cfg = Config::Load(config_path);
+    cfg.policy_path = ResolvePolicyPath(config_path, cfg.policy_path);
     JointCalibration calib(cfg);
 
     signal(SIGINT, SignalHandler);
