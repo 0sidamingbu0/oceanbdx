@@ -1,5 +1,6 @@
 # 把训练导出的 policy.onnx 放在这里
 build/
 *.onnx
+!policy.onnx
 *.pt
 !.gitkeep
