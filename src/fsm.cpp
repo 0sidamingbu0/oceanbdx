@@ -17,6 +17,7 @@ const char *FsmStateName(FsmState s)
     {
     case FsmState::PASSIVE: return "PASSIVE";
     case FsmState::BOOT_CHECK: return "BOOT_CHECK";
+    case FsmState::SIT_ALIGN: return "SIT_ALIGN";
     case FsmState::SIT_HOLD: return "SIT_HOLD";
     case FsmState::STAND_UP: return "STAND_UP";
     case FsmState::RL_BALANCE: return "RL_BALANCE";
@@ -76,7 +77,12 @@ std::vector<JointCommand> Fsm::Update(const RobotState &s,
         Transit(FsmState::PASSIVE);
         break;
     case FsmEvent::BOOT:
-        if (state_ == FsmState::PASSIVE || state_ == FsmState::DAMPING) Transit(FsmState::BOOT_CHECK);
+        if (state_ == FsmState::PASSIVE || state_ == FsmState::DAMPING)
+        {
+            sit_align_start_pose_.resize(cfg_.num_joints);
+            for (int i = 0; i < cfg_.num_joints; ++i) sit_align_start_pose_[i] = s.joints[i].q;
+            Transit(FsmState::SIT_ALIGN);
+        }
         break;
     case FsmEvent::STAND:
         if (state_ == FsmState::SIT_HOLD)
@@ -108,6 +114,7 @@ std::vector<JointCommand> Fsm::Update(const RobotState &s,
     {
     case FsmState::PASSIVE: return DoPassive(s);
     case FsmState::BOOT_CHECK: return DoBootCheck(s);
+    case FsmState::SIT_ALIGN: return DoSitAlign(s);
     case FsmState::SIT_HOLD: return DoSitHold(s);
     case FsmState::STAND_UP: return DoStandUp(s);
     case FsmState::RL_BALANCE: return DoRl(s, {0.0, 0.0, 0.0});
@@ -131,8 +138,11 @@ std::vector<JointCommand> Fsm::DoBootCheck(const RobotState &s)
     if (calib_.ValidateBootPose(q, &bad))
     {
         message_ = "boot check OK";
-        hold_pose_ = q; // 锁定当前坐姿
+        hold_pose_.resize(cfg_.num_joints);
+        for (int i = 0; i < cfg_.num_joints; ++i)
+            hold_pose_[i] = std::min(std::max(cfg_.sit_pose[i], cfg_.joint_lower[i]), cfg_.joint_upper[i]);
         Transit(FsmState::SIT_HOLD);
+        return DoSitHold(s);
     }
     else if (state_time_ > 2.0)
     {
@@ -140,8 +150,36 @@ std::vector<JointCommand> Fsm::DoBootCheck(const RobotState &s)
         for (int j : bad) message_ += " " + cfg_.joint_names[j];
         std::cerr << "[FSM] " << message_ << std::endl;
         Transit(FsmState::PASSIVE);
+        return DoPassive(s);
     }
-    return DoPassive(s);
+
+    std::vector<JointCommand> cmds(cfg_.num_joints);
+    for (int i = 0; i < cfg_.num_joints; ++i)
+    {
+        cmds[i].q = std::min(std::max(cfg_.sit_pose[i], cfg_.joint_lower[i]), cfg_.joint_upper[i]);
+        cmds[i].kp = cfg_.fixed_kp[i];
+        cmds[i].kd = cfg_.fixed_kd[i];
+    }
+    return cmds;
+}
+
+std::vector<JointCommand> Fsm::DoSitAlign(const RobotState &)
+{
+    const double duration = std::max(cfg_.sit_align_duration, cfg_.control_dt);
+    double r = std::min(state_time_ / duration, 1.0);
+    double a = 0.5 * (1.0 - std::cos(M_PI * r));
+
+    std::vector<JointCommand> cmds(cfg_.num_joints);
+    for (int i = 0; i < cfg_.num_joints; ++i)
+    {
+        double target = std::min(std::max(cfg_.sit_pose[i], cfg_.joint_lower[i]), cfg_.joint_upper[i]);
+        cmds[i].q = sit_align_start_pose_[i] * (1.0 - a) + target * a;
+        cmds[i].kp = cfg_.fixed_kp[i];
+        cmds[i].kd = cfg_.fixed_kd[i];
+    }
+
+    if (r >= 1.0) Transit(FsmState::BOOT_CHECK);
+    return cmds;
 }
 
 std::vector<JointCommand> Fsm::DoSitHold(const RobotState &)

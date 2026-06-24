@@ -112,6 +112,7 @@ Config Config::Load(const std::string &yaml_path)
         c.torque_limits = GetVec<double>(ctrl, "torque_limits");
         c.joint_lower = GetVec<double>(ctrl, "joint_lower");
         c.joint_upper = GetVec<double>(ctrl, "joint_upper");
+        c.sit_align_duration = Get<double>(ctrl, "sit_align_duration", 3.0);
         c.stand_duration = Get<double>(ctrl, "stand_duration", 3.0);
         c.damping_kd = Get<double>(ctrl, "damping_kd", 2.0);
     }

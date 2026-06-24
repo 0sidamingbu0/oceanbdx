@@ -1,8 +1,8 @@
 /*
  * OceanBDX - 控制状态机
  *
- * PASSIVE ──(L1/'0')──▶ BOOT_CHECK ──校验通过──▶ SIT_HOLD ──(start/'1')──▶
- * STAND_UP(脚本插值) ──完成──▶ RL_BALANCE(站立策略) ──(A/'2')──▶ RL_WALK(定速行走)
+ * PASSIVE ──(L1/'0')──▶ SIT_ALIGN(脚本回蹲姿) ──校验通过──▶ SIT_HOLD ──(start/'1')──▶
+ * STAND_UP(脚本起立) ──完成──▶ RL_BALANCE(站立策略) ──(A/'2')──▶ RL_WALK(定速行走)
  *
  * 任何状态按 select/'9' 或姿态保护触发 ──▶ DAMPING (阻尼软停)
  * RL_WALK 速度指令归零自动回 RL_BALANCE 行为 (同一policy时仅指令不同)。
@@ -33,6 +33,7 @@ enum class FsmState
 {
     PASSIVE,     // 上电默认: 全部电机零增益
     BOOT_CHECK,  // 坐姿校验电机绝对位置 (多圈歧义检查)
+    SIT_ALIGN,   // 缓慢移动到坐姿/蹲姿, 然后做坐姿校验
     SIT_HOLD,    // 坐姿位置保持
     STAND_UP,    // 脚本插值: 坐姿 -> 站立姿态
     RL_BALANCE,  // RL自平衡站立 (cmd = 0)
@@ -46,7 +47,7 @@ const char *FsmStateName(FsmState s);
 enum class FsmEvent
 {
     NONE,
-    BOOT,        // 请求坐姿校验
+    BOOT,        // 请求缓慢回坐姿并校验
     STAND,       // 请求起立
     WALK,        // 进入行走
     BALANCE,     // 回到静态平衡
@@ -75,6 +76,7 @@ private:
 
     std::vector<JointCommand> DoPassive(const RobotState &s);
     std::vector<JointCommand> DoBootCheck(const RobotState &s);
+    std::vector<JointCommand> DoSitAlign(const RobotState &s);
     std::vector<JointCommand> DoSitHold(const RobotState &s);
     std::vector<JointCommand> DoStandUp(const RobotState &s);
     std::vector<JointCommand> DoRl(const RobotState &s, const std::array<double, 3> &cmd);
@@ -88,6 +90,7 @@ private:
     std::string message_;
     double state_time_ = 0.0;                 // 当前状态持续时间 (s)
     int rl_tick_ = 0;                         // decimation 计数
+    std::vector<double> sit_align_start_pose_; // 回蹲姿插值起点
     std::vector<double> stand_start_pose_;    // 起立插值起点
     std::vector<double> hold_pose_;           // SIT_HOLD 锁定姿态
     std::vector<double> rl_target_;           // 最近一次策略输出

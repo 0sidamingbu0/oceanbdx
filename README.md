@@ -12,7 +12,7 @@
 - 双腿各一路 USB转485, 每腿 5×宇树 GO-M8010-6
 - IMU: YIS320, 一路USB转串口
 - 脖子: 1×M8010 + 3×飞特舵机 (驱动已移植, 控制暂不实现)
-- 状态机: `PASSIVE → BOOT_CHECK(坐姿校验) → SIT_HOLD → STAND_UP(脚本) → RL_BALANCE → RL_WALK`, 任意状态可进 `DAMPING` 软停
+- 状态机: `PASSIVE → SIT_ALIGN(脚本回蹲姿) → BOOT_CHECK(坐姿校验) → SIT_HOLD → STAND_UP(脚本) → RL_BALANCE → RL_WALK`, 任意状态可进 `DAMPING` 软停
 - 电机零位=结构限位, URDF零位=站立姿态, 偏移由 `config/oceanbdx.yaml` 的 `calibration` 段管理
 - 策略: IsaacLab 导出 ONNX, C++ onnxruntime 推理
 

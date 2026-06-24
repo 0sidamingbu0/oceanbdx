@@ -60,6 +60,7 @@ struct Config
     std::vector<double> torque_limits;
     std::vector<double> joint_lower;           // 关节软限位 (URDF坐标)
     std::vector<double> joint_upper;
+    double sit_align_duration = 3.0;           // 上电回蹲姿脚本时长 (s)
     double stand_duration = 3.0;               // 起立脚本时长 (s)
     double damping_kd = 2.0;                   // 阻尼保护模式 kd
 

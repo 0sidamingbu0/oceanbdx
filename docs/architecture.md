@@ -120,8 +120,8 @@ M8010转子单圈绝对值编码器经6.33减速后, 输出轴每 360°/6.33≈5
 ## 5. 状态机设计 (启动→站立→RL)
 
 ```
-PASSIVE ──0──▶ BOOT_CHECK ──通过──▶ SIT_HOLD ──1──▶ STAND_UP ──完成──▶ RL_BALANCE ──2──▶ RL_WALK
-   ▲                │失败                            (脚本插值)            (cmd=0)    ◀──3──┘
+PASSIVE ──0──▶ SIT_ALIGN ──▶ BOOT_CHECK ──通过──▶ SIT_HOLD ──1──▶ STAND_UP ──完成──▶ RL_BALANCE ──2──▶ RL_WALK
+   ▲          (脚本回蹲姿)        │失败                            (脚本起立)            (cmd=0)    ◀──3──┘
    └────────────────┘                  任意状态 ──9/姿态保护──▶ DAMPING (kd阻尼软停)
 ```
 
