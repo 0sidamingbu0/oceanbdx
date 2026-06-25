@@ -15,6 +15,8 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
     python3 sim2sim/mujoco_sim.py --real --no-policy # 仿真目标角→真机, 面板显示真机误差
     python3 sim2sim/mujoco_sim.py --real --manual # 真机联调: 拖动滑块→PD下发到真机
     # ★ --real 需先安装 unitree_actuator_sdk, 且停掉 C++ 主控 oceanbdx_run (串口互斥)
+    # 默认每次 policy 推理把 观测+raw/clip动作+目标角 写入 runlog/sim2sim_<时间戳>.csv,
+    # 并在终端刷新 state/cmd/高度/倾斜/速度/|act|max/饱和数; 用 --no-log 关闭。
 
 键盘 (★推荐聚焦“终端窗口”操作, 与真机 main.cpp 一致, 不触发 MuJoCo 快捷键):
     0 = 真机缓慢到蹲姿   1 = 起立   2 = 行走   3 = 回平衡   9 = 阻尼   r = 重置
@@ -241,6 +243,71 @@ class Policy:
         return self.default_dof_pos + c["action_scale"] * act
 
 
+class RunLogger:
+    """把每个 policy step 的观测/动作/姿态写入带时间戳的 CSV (runlog/),
+    并按节流间隔在终端刷新关键参数, 便于实时观察策略是否生效。
+
+    每行 = 一次 policy 推理 (RL_BALANCE / RL_WALK 下 decimation 对齐时)。
+    观测拆成各物理量分列, 动作记录 raw(网络原始) / clip(裁剪后) / target(下发关节角)。
+    """
+
+    def __init__(self, nj, term_interval=0.3, path=None):
+        self.nj = nj
+        self.term_interval = float(term_interval)
+        self._last_term = -1e9
+        os.makedirs(os.path.join(ROOT, "runlog"), exist_ok=True)
+        if path is None:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(ROOT, "runlog", f"sim2sim_{stamp}.csv")
+        self.path = path
+        self.f = open(path, "w", buffering=1)  # 行缓冲, 实时落盘
+        leg = [j.replace("_joint", "") for j in LEG_JOINTS]
+        cols = (["t", "state", "cmd_vx", "cmd_vy", "cmd_wz",
+                 "base_z", "tilt_x", "tilt_y",
+                 "vel_bx", "vel_by", "vel_bz",
+                 "gyro_x", "gyro_y", "gyro_z"]
+                + [f"q_{j}" for j in leg]
+                + [f"dq_{j}" for j in leg]
+                + [f"raw_{j}" for j in leg]
+                + [f"act_{j}" for j in leg]
+                + [f"tgt_{j}" for j in leg])
+        self.cols = cols
+        self.f.write(",".join(cols) + "\n")
+        print(f"[runlog] 写入 {path}")
+
+    def log(self, t, state, cmd, base_z, tilt, vel_b, gyro, q, dq,
+            raw_action, action, target):
+        row = ([f"{t:.4f}", state,
+                f"{cmd[0]:.4f}", f"{cmd[1]:.4f}", f"{cmd[2]:.4f}",
+                f"{base_z:.4f}", f"{tilt[0]:.4f}", f"{tilt[1]:.4f}",
+                f"{vel_b[0]:.4f}", f"{vel_b[1]:.4f}", f"{vel_b[2]:.4f}",
+                f"{gyro[0]:.4f}", f"{gyro[1]:.4f}", f"{gyro[2]:.4f}"]
+               + [f"{v:.4f}" for v in q]
+               + [f"{v:.4f}" for v in dq]
+               + [f"{v:.4f}" for v in raw_action]
+               + [f"{v:.4f}" for v in action]
+               + [f"{v:.4f}" for v in target])
+        self.f.write(",".join(row) + "\n")
+
+        if t - self._last_term >= self.term_interval:
+            self._last_term = t
+            sat = int(np.sum(np.abs(action) > 0.98))
+            print(
+                f"[run] t={t:6.2f} {state:10s} "
+                f"cmd=[{cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f}] "
+                f"z={base_z:.3f} tilt=[{tilt[0]:+.3f},{tilt[1]:+.3f}] "
+                f"vel_b=[{vel_b[0]:+.2f},{vel_b[1]:+.2f}] "
+                f"|act|max={np.max(np.abs(action)):.2f} sat={sat}/{self.nj} "
+                f"|dq|max={np.max(np.abs(dq)):.2f}"
+            )
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
 class Sim:
     def __init__(self, args):
         full = yaml.safe_load(open(args.config))["oceanbdx"]
@@ -328,6 +395,8 @@ class Sim:
         self.state = "SIT"
         self.state_time = 0.0
         self.cmd = np.zeros(3)
+        self.run_logger = None
+        self.want_runlog = not bool(getattr(args, "no_log", False))
         self.rl_target = self.stand_pose.copy()
         self.rl_tick = 0
         self.stand_start = self.sit_pose.copy()
@@ -819,10 +888,20 @@ class Sim:
                     print("[FSM] STAND_UP -> RL_BALANCE")
         elif self.state in ("RL_BALANCE", "RL_WALK"):
             cmd = self.cmd if self.state == "RL_WALK" else np.zeros(3)
-            if self.rl_tick % self.decimation == 0:
+            fresh_policy = self.rl_tick % self.decimation == 0
+            if fresh_policy:
                 self.rl_target = self.policy.step(q, dq, quat, gyro, cmd)
             self.rl_tick += 1
             target, kp, kd = self.rl_target, self.kp, self.kd
+            if fresh_policy and self.run_logger is not None:
+                tilt = quat_rotate_inverse_gravity(quat)
+                _, vel_b = self.base_linear_velocities()
+                self.run_logger.log(
+                    self.data.time, self.state, cmd,
+                    float(self.data.qpos[2]), tilt, vel_b, gyro, q, dq,
+                    self.policy.last_raw_actions, self.policy.last_actions,
+                    self.rl_target,
+                )
         else:  # DAMPING
             target, kp, kd = q, np.zeros(self.nj), np.full(self.nj, self.damping_kd)
 
@@ -987,6 +1066,9 @@ class Sim:
             except Exception as e:
                 print(f"[real] 无法创建输出面板 ({e}); 可用键盘 p/0 控制")
 
+        if self.want_runlog and self.policy:
+            self.run_logger = RunLogger(self.nj)
+
         stdin_thread, restore_stdin = self._start_stdin_thread()
         try:
             with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self.key_cb) as v:
@@ -1009,6 +1091,8 @@ class Sim:
         finally:
             self._stdin_alive = False
             restore_stdin()
+            if self.run_logger:
+                self.run_logger.close()
             if self.bridge:
                 self.bridge.stop()
             if self.real_panel:
@@ -1024,6 +1108,8 @@ if __name__ == "__main__":
                     help="连接真机电机: 普通sim2sim中输出仿真目标角; 与 --manual 组合时为滑块联调")
     ap.add_argument("--manual", action="store_true",
                     help="打开关节角拖动滑块面板 (可与 --real 组合)")
+    ap.add_argument("--no-log", action="store_true",
+                    help="关闭 runlog/ 观测+动作记录与终端刷新 (默认开启)")
     ap.add_argument("--debug-obs", action="store_true",
                     help="打印base姿态/IMU等效观测/policy动作, 用于检查sim2sim坐标系")
     ap.add_argument("--debug-actions", action="store_true",

@@ -103,12 +103,14 @@ oceanbdx:
 
   # ---- MuJoCo sim2sim 专用覆盖 ----
   # Isaac Lab 训练使用 implicit actuator，MuJoCo 这里用显式 torque PD。
-  # 同样的 kd=2.5 在 MuJoCo 中阻尼偏小，会导致 RL 接管后抖动摔倒；
-  # 逐关节阻尼用于兼顾侧向抗推和前后抗推：髋部保留一定响应，膝/踝增加阻尼。
-  # 这里只覆盖 sim2sim，不影响 C++/真机侧 control.rl_kd。
+  # ★ 2026-06-25: bdx_stand_stable 模型(加了 contact_force_rate 抗抖项)需用与
+  #   训练一致的 kd=2.5。之前的 [5,4,8,8,8,...] 是给旧(已废弃)策略救场的, 对新
+  #   策略反而把它学好的"平滑接触力"打散——实测 kd=2.5 站满 450 步不倒、能抗
+  #   30N 侧推; kd=6 起就侧漂 1m/s 摔倒。故覆盖回训练阻尼, 与真机 control.rl_kd 一致。
+  #   (sim2sim 验证: scan_ckpt / debug-push 见 changelog/2026-06-25.md)
   sim2sim:
     action_scale: 0.25
-    rl_kd: [5.0, 4.0, 8.0, 8.0, 8.0,  5.0, 4.0, 8.0, 8.0, 8.0]
+    rl_kd: [2.5, 2.5, 2.5, 2.5, 2.5,  2.5, 2.5, 2.5, 2.5, 2.5]
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机
