@@ -16,10 +16,13 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
     python3 sim2sim/mujoco_sim.py --real --manual # 真机联调: 拖动滑块→PD下发到真机
     # ★ --real 需先安装 unitree_actuator_sdk, 且停掉 C++ 主控 oceanbdx_run (串口互斥)
 
-键盘 (MuJoCo viewer 窗口内):
+键盘 (★推荐聚焦“终端窗口”操作, 与真机 main.cpp 一致, 不触发 MuJoCo 快捷键):
     0 = 真机缓慢到蹲姿   1 = 起立   2 = 行走   3 = 回平衡   9 = 阻尼   r = 重置
     p = 真机电机输出开关
-    ↑/↓ = vx±0.1   ←/→ = wz±0.1   x = 速度清零
+    w/s = vx±0.1   a/d = vy±0.1   q/e = wz±0.1   x = 速度清零
+    (速度指令仅在 RL_WALK 状态生效, 先按 2 进入行走)
+    MuJoCo 窗口内也可按同样的键(方向键映射到 w/s/q/e), 但数字键会附带触发
+    MuJoCo 自带 geomgroup 切换, 已每帧复位防止机器人 geom 被隐藏。
 """
 import argparse
 import os
@@ -622,10 +625,35 @@ class Sim:
             )
 
     def key_cb(self, keycode):
-        c = chr(keycode) if keycode < 256 else ""
+        """MuJoCo viewer 窗口内的按键回调。
+
+        ★ 注意: launch_passive 的窗口按键会同时触发 MuJoCo 自带快捷键
+          (数字键切 geomgroup 可见性、方向键步进/调速), 无法在 Python 侧屏蔽。
+          推荐改用**终端键盘** (run() 里的 stdin 线程), 与真机 main.cpp 一致,
+          按键不进 MuJoCo 窗口, 无冲突。此回调保留为窗口内备用。
+        """
+        # 方向键映射到 w/s/q/e 等价指令 (上下=vx, 左右=wz)
+        if keycode == 265:
+            return self._cmd_key("w")
+        if keycode == 264:
+            return self._cmd_key("s")
+        if keycode == 263:
+            return self._cmd_key("q")
+        if keycode == 262:
+            return self._cmd_key("e")
+        if keycode >= 256:
+            return
+        self._cmd_key(chr(keycode).lower())
+
+    def _cmd_key(self, c):
+        """处理单个按键字符 (已转小写)。窗口回调与终端线程共用。
+
+        与真机 src/main.cpp 一致: 0/1/2/3=状态 9=阻尼 r=重置 p=电机开关
+        w/s=vx± a/d=vy± q/e=wz± x=速度清零
+        """
         if c == "0":
             self.start_real_sit_align()
-        elif c in ("p", "P"):
+        elif c == "p":
             if not self.bridge:
                 print("[real] 未连接真机桥接, 忽略电机输出开关")
                 return
@@ -655,22 +683,28 @@ class Sim:
             self.state = "DAMPING"
             self.disable_real_output("DAMPING")
             print("[FSM] -> DAMPING")
-        elif c in ("r", "R"):
+        elif c == "r":
             self.reset()
             self.disable_real_output("RESET")
         elif c == "x":
             self.cmd[:] = 0
-        elif keycode == 265:  # up
+        elif c == "w":
             self.cmd[0] = min(self.cmd[0] + 0.1, self.max_vel[0])
-        elif keycode == 264:  # down
+        elif c == "s":
             self.cmd[0] = max(self.cmd[0] - 0.1, -self.max_vel[0])
-        elif keycode == 263:  # left
+        elif c == "a":
+            self.cmd[1] = min(self.cmd[1] + 0.1, self.max_vel[1])
+        elif c == "d":
+            self.cmd[1] = max(self.cmd[1] - 0.1, -self.max_vel[1])
+        elif c == "q":
             self.cmd[2] = min(self.cmd[2] + 0.1, self.max_vel[2])
-        elif keycode == 262:  # right
+        elif c == "e":
             self.cmd[2] = max(self.cmd[2] - 0.1, -self.max_vel[2])
-        if c in "0123pPrR":
+        else:
             return
-        print(f"cmd = {self.cmd}")
+        if c in "wsadqex":
+            tag = "" if self.state == "RL_WALK" else "  (仅 RL_WALK 生效, 先按2)"
+            print(f"cmd = vx={self.cmd[0]:+.2f} vy={self.cmd[1]:+.2f} wz={self.cmd[2]:+.2f}{tag}")
 
     # ---------- 真机输出 ----------
     def disable_real_output(self, reason=""):
@@ -887,6 +921,47 @@ class Sim:
         if panel:
             panel.close()
 
+    def _start_stdin_thread(self):
+        """后台线程: 从终端读单键, 走 _cmd_key, 与真机 main.cpp 一致。
+
+        终端按键不进 MuJoCo 窗口, 因此不会触发 MuJoCo 自带快捷键。
+        非 TTY (如管道/重定向) 时跳过, 仅保留窗口回调。
+        返回 (thread_or_None, restore_fn)。
+        """
+        import threading
+
+        if not sys.stdin.isatty():
+            print("[sim2sim] stdin 非终端, 跳过终端键盘; 仅窗口内按键可用")
+            return None, (lambda: None)
+
+        try:
+            import termios
+            import tty
+        except ImportError:
+            return None, (lambda: None)
+
+        fd = sys.stdin.fileno()
+        old_attr = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        self._stdin_alive = True
+
+        def restore():
+            termios.tcsetattr(fd, termios.TCSANOW, old_attr)
+
+        def reader():
+            import select
+            while self._stdin_alive:
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if r:
+                    ch = sys.stdin.read(1)
+                    if ch:
+                        self._cmd_key(ch.lower())
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        print("[sim2sim] 终端键盘已启用 (聚焦本终端窗口操作, 避免 MuJoCo 快捷键冲突)")
+        return t, restore
+
     def run(self):
         if getattr(self, "probe_policy_only", False):
             return self.probe_policy()
@@ -912,8 +987,12 @@ class Sim:
             except Exception as e:
                 print(f"[real] 无法创建输出面板 ({e}); 可用键盘 p/0 控制")
 
+        stdin_thread, restore_stdin = self._start_stdin_thread()
         try:
             with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self.key_cb) as v:
+                # 记录初始 geom 可见组, 每帧复位; 防止窗口内误按数字键
+                # 触发 MuJoCo 自带 geomgroup 切换把机器人 geom 隐藏。
+                geomgroup0 = np.array(v.opt.geomgroup).copy()
                 while v.is_running() and (self.real_panel is None or self.real_panel.alive()):
                     t0 = time.time()
                     tau, neck_tau = self.control_step()
@@ -922,11 +1001,14 @@ class Sim:
                         self.data.qfrc_applied[self.v_adr] = tau
                         self.data.qfrc_applied[self.neck_v_adr] = neck_tau
                         mujoco.mj_step(self.model, self.data)
+                    v.opt.geomgroup[:] = geomgroup0
                     v.sync()
                     dt_left = self.control_dt - (time.time() - t0)
                     if dt_left > 0:
                         time.sleep(dt_left)
         finally:
+            self._stdin_alive = False
+            restore_stdin()
             if self.bridge:
                 self.bridge.stop()
             if self.real_panel:

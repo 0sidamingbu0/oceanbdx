@@ -28,7 +28,16 @@ sim2sim/           MuJoCo 仿真验证
 scripts/           urdf2mjcf转换、零位测量工具
 policy/            放置训练导出的 policy.onnx
 docs/              方案架构文档
+changelog/         每日修改履历 (见下方约定)
 ```
+
+## 修改履历 (changelog)
+
+每天的改动记录统一放在 [changelog/](changelog/) 文件夹, 一天一个文件, 命名 `YYYY-MM-DD.md`。
+目的: 留存历史上下文, 便于自己回溯, 也便于其他工程/协作者快速理解本工程的演进履历。
+
+每篇建议写清: 背景/现象、涉及文件、改了什么、为什么这么改、验证结论、遗留待办。
+跨工程的根因排查 (如 sim2sim 与 IsaacLab 训练侧联调) 也记在当天文件里。
 
 ## 快速开始
 
@@ -65,6 +74,11 @@ python3 scripts/urdf2mjcf.py                  # 生成 sim2sim/ocean_scene.xml
 python3 sim2sim/mujoco_sim.py --no-policy     # 仅验证起立脚本
 python3 sim2sim/mujoco_sim.py                 # 加载 policy/policy.onnx 完整验证
 ```
+
+键盘 (★聚焦运行脚本的**终端窗口**操作, 与真机 main.cpp 一致, 不会触发 MuJoCo 自带快捷键):
+`0`蹲姿 `1`起立 `2`行走 `3`回平衡 `9`阻尼 `r`重置 `p`真机电机开关；
+`w/s`=vx± `a/d`=vy± `q/e`=wz± `x`速度清零 (速度仅在 `2` 行走态生效)。
+MuJoCo 窗口内也能按 (方向键映射到 w/s/q/e), 但数字键会附带触发 MuJoCo 的 geomgroup 切换, 故脚本每帧复位可见组防止机器人消失; 推荐还是用终端操作。
 
 sim2sim 与 IsaacLab 不一致时, 尤其是外力后单脚支撑发散、横漂或动作饱和, 先看 [docs/architecture.md](docs/architecture.md) 的 “sim2sim kd 调试记录”。
 
