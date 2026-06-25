@@ -143,6 +143,7 @@ void ImuDriver::ReadLoop()
                     b.accel[1] = info_.accel.y;
                     b.accel[2] = info_.accel.z;
                     front_.store(back, std::memory_order_release);
+                    sequence_.fetch_add(1, std::memory_order_release);
                     valid_.store(true);
 
                     if (++update_count >= 100)

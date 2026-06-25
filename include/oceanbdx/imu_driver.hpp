@@ -31,6 +31,7 @@ public:
     ImuState GetState() const;
     bool IsValid() const { return valid_.load(); }
     double UpdateHz() const { return update_hz_.load(); }
+    uint64_t Sequence() const { return sequence_.load(std::memory_order_acquire); }
 
 private:
     void ReadLoop();
@@ -43,6 +44,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> valid_{false};
     std::atomic<double> update_hz_{0.0};
+    std::atomic<uint64_t> sequence_{0};
 
     // 无锁发布: 双缓冲 + 序号
     struct Sample

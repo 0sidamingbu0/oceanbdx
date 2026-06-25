@@ -98,6 +98,9 @@ if(BUILD_TESTS)
     add_executable(test_imu tests/test_imu.cpp)
     target_link_libraries(test_imu oceanbdx_core)
 
+    add_executable(record_imu_noise tests/record_imu_noise.cpp)
+    target_link_libraries(record_imu_noise oceanbdx_core)
+
     add_executable(test_neck tests/test_neck.cpp)
     target_link_libraries(test_neck oceanbdx_core)
 
