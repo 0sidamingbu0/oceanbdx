@@ -21,6 +21,7 @@ struct PolicyRunner::Impl
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::string input_name, output_name;
     int64_t obs_dim = 0;
+    double gait_phase = 0.0;
 };
 
 PolicyRunner::PolicyRunner(const Config &cfg) : cfg_(cfg), impl_(new Impl())
@@ -58,6 +59,7 @@ void PolicyRunner::Reset()
 {
     std::fill(last_actions_.begin(), last_actions_.end(), 0.0f);
     std::fill(last_raw_actions_.begin(), last_raw_actions_.end(), 0.0f);
+    impl_->gait_phase = 0.0;
 }
 
 std::array<double, 3> PolicyRunner::ProjectedGravity(const std::array<double, 4> &q)
@@ -79,7 +81,7 @@ std::vector<double> PolicyRunner::Step(const std::vector<double> &q,
 {
     const int nj = cfg_.num_joints;
     std::vector<float> obs;
-    obs.reserve(9 + 3 * nj);
+    obs.reserve(11 + 3 * nj);
 
     for (int i = 0; i < 3; ++i)
         obs.push_back(static_cast<float>(gyro[i] * cfg_.ang_vel_scale));
@@ -90,6 +92,15 @@ std::vector<double> PolicyRunner::Step(const std::vector<double> &q,
 
     for (int i = 0; i < 3; ++i)
         obs.push_back(static_cast<float>(cmd[i] * cfg_.commands_scale[i]));
+
+    constexpr double kPi = 3.14159265358979323846;
+    obs.push_back(static_cast<float>(std::sin(2.0 * kPi * impl_->gait_phase)));
+    obs.push_back(static_cast<float>(std::cos(2.0 * kPi * impl_->gait_phase)));
+    const double policy_dt = cfg_.control_dt * std::max(1, cfg_.decimation);
+    impl_->gait_phase = std::fmod(
+        impl_->gait_phase + policy_dt / std::max(1.0e-6, cfg_.gait_cycle_period),
+        1.0
+    );
 
     for (int i = 0; i < nj; ++i)
         obs.push_back(static_cast<float>((q[i] - cfg_.default_dof_pos[i]) * cfg_.dof_pos_scale));

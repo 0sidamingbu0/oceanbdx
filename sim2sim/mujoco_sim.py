@@ -210,7 +210,10 @@ class Policy:
         self.cfg = cfg
         self.nj = num_joints
         self.default_dof_pos = np.array(cfg["default_dof_pos"], dtype=np.float32)
-        self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 0.25]), dtype=np.float32)
+        self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 1.0]), dtype=np.float32)
+        self.gait_cycle_period = float(cfg.get("gait_cycle_period", 0.6))
+        self.policy_dt = float(cfg.get("policy_dt", 0.05))
+        self.gait_phase = 0.0
         self.last_actions = np.zeros(self.nj, dtype=np.float32)
         self.last_obs = None
         self.last_projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
@@ -221,18 +224,25 @@ class Policy:
         self.last_obs = None
         self.last_projected_gravity[:] = [0.0, 0.0, -1.0]
         self.last_raw_actions[:] = 0
+        self.gait_phase = 0.0
 
     def step(self, q, dq, quat, gyro, cmd):
         c = self.cfg
         projected_gravity = quat_rotate_inverse_gravity(quat)
+        gait_clock = np.array([
+            np.sin(2.0 * np.pi * self.gait_phase),
+            np.cos(2.0 * np.pi * self.gait_phase),
+        ], dtype=np.float32)
         obs = np.concatenate([
             gyro * c["ang_vel_scale"],
             projected_gravity,
             np.asarray(cmd) * self.commands_scale,
+            gait_clock,
             (q - self.default_dof_pos) * c["dof_pos_scale"],
             dq * c["dof_vel_scale"],
             self.last_actions,
         ]).astype(np.float32)
+        self.gait_phase = (self.gait_phase + self.policy_dt / self.gait_cycle_period) % 1.0
         self.last_projected_gravity = projected_gravity.astype(np.float32)
         obs = np.clip(obs, -c["clip_obs"], c["clip_obs"])
         self.last_obs = obs.copy()
@@ -382,6 +392,7 @@ class Sim:
             if os.path.exists(pol_path):
                 pcfg = dict(full["policy"])
                 pcfg["default_dof_pos"] = pcfg["default_dof_pos"][:self.nj]
+                pcfg["policy_dt"] = float(full["control"]["dt"]) * int(full["control"]["decimation"])
                 sim2sim_ctrl = full.get("sim2sim", {})
                 if "action_scale" in sim2sim_ctrl:
                     pcfg["action_scale"] = sim2sim_ctrl["action_scale"]

@@ -75,6 +75,13 @@ python3 sim2sim/mujoco_sim.py --no-policy     # 仅验证起立脚本
 python3 sim2sim/mujoco_sim.py                 # 加载 policy/policy.onnx 完整验证
 ```
 
+> **跑 IsaacLab / 需要 torch 的脚本时(如 `sim2sim/scan_ckpt.py`、`export_ckpt_onnx.py`),用 IsaacLab 运行时 python:**
+> ```bash
+> /home/ocean/oceanisaaclab/oceanisaaclab/_isaaclab/isaaclab.sh -p <脚本.py> [参数]
+> ```
+> 该 python 同时具备 torch + mujoco + onnxruntime,避免再去折腾 conda 环境(base 缺 torch、sar 缺 mujoco)。
+> `mujoco_sim.py --probe-policy` / `--debug-push-steps` 等纯推理工具用 base 的 `python3` 即可(只需 mujoco+onnxruntime)。
+
 键盘 (★聚焦运行脚本的**终端窗口**操作, 与真机 main.cpp 一致, 不会触发 MuJoCo 自带快捷键):
 `0`蹲姿 `1`起立 `2`行走 `3`回平衡 `9`阻尼 `r`重置 `p`真机电机开关；
 `w/s`=vx± `a/d`=vy± `q/e`=wz± `x`速度清零 (速度仅在 `2` 行走态生效)。

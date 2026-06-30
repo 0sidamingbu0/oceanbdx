@@ -132,6 +132,7 @@ Config Config::Load(const std::string &yaml_path)
         c.clip_obs = Get<double>(pol, "clip_obs", 100.0);
         auto cs = GetVec<double>(pol, "commands_scale");
         if (cs.size() == 3) c.commands_scale = cs;
+        c.gait_cycle_period = Get<double>(pol, "gait_cycle_period", 0.6);
         c.default_dof_pos = GetVec<double>(pol, "default_dof_pos");
     }
 

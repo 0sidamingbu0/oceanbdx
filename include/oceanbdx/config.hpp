@@ -68,14 +68,15 @@ struct Config
 
     // ---- 策略 ----
     std::string policy_path;                   // ONNX 模型路径
-    int num_obs = 0;                           // 0 = 自动 (9 + 3*num_joints)
+    int num_obs = 0;                           // 0 = 使用ONNX输入维度
     double ang_vel_scale = 0.25;
     double dof_pos_scale = 1.0;
     double dof_vel_scale = 0.05;
     double action_scale = 0.25;
     double clip_actions = 100.0;
     double clip_obs = 100.0;
-    std::vector<double> commands_scale = {2.0, 2.0, 0.25};
+    std::vector<double> commands_scale = {2.0, 2.0, 1.0};
+    double gait_cycle_period = 0.6;            // 低速行走v2 gait clock周期(s)
     std::vector<double> default_dof_pos;       // 策略动作叠加的默认关节角
 
     // ---- 速度指令限幅 ----

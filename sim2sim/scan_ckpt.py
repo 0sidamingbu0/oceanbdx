@@ -25,7 +25,9 @@ class CkptPolicy:
         self.cfg = cfg
         self.nj = nj
         self.default_dof_pos = np.array(cfg["default_dof_pos"], dtype=np.float32)
-        self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 0.25]), dtype=np.float32)
+        self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 1.0]), dtype=np.float32)
+        self.gait_cycle_period = float(cfg.get("gait_cycle_period", 0.6))
+        self.policy_dt = float(cfg.get("policy_dt", 0.05))
         self.reset()
 
     def reset(self):
@@ -33,6 +35,7 @@ class CkptPolicy:
         self.last_raw_actions = np.zeros(self.nj, dtype=np.float32)
         self.last_obs = None
         self.last_projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self.gait_phase = 0.0
 
     @staticmethod
     def _elu(x):
@@ -46,14 +49,20 @@ class CkptPolicy:
     def step(self, q, dq, quat, gyro, cmd):
         c = self.cfg
         pg = MS.quat_rotate_inverse_gravity(quat)
+        gait_clock = np.array([
+            np.sin(2.0 * np.pi * self.gait_phase),
+            np.cos(2.0 * np.pi * self.gait_phase),
+        ], dtype=np.float32)
         obs = np.concatenate([
             gyro * c["ang_vel_scale"],
             pg,
             np.asarray(cmd) * self.commands_scale,
+            gait_clock,
             (q - self.default_dof_pos) * c["dof_pos_scale"],
             dq * c["dof_vel_scale"],
             self.last_actions,
         ]).astype(np.float32)
+        self.gait_phase = (self.gait_phase + self.policy_dt / self.gait_cycle_period) % 1.0
         self.last_projected_gravity = pg.astype(np.float32)
         obs = np.clip(obs, -c["clip_obs"], c["clip_obs"])
         self.last_obs = obs.copy()
@@ -126,9 +135,11 @@ def main():
                            sim_rl_kd_list=args.sim_rl_kd_list, sim_action_scale=None)
     sim = MS.Sim(a)
 
-    pcfg = dict(__import__("yaml").safe_load(open(args.config))["oceanbdx"]["policy"])
+    full_cfg = __import__("yaml").safe_load(open(args.config))["oceanbdx"]
+    pcfg = dict(full_cfg["policy"])
     pcfg["default_dof_pos"] = pcfg["default_dof_pos"][:sim.nj]
-    s2s = __import__("yaml").safe_load(open(args.config))["oceanbdx"].get("sim2sim", {})
+    pcfg["policy_dt"] = float(full_cfg["control"]["dt"]) * int(full_cfg["control"]["decimation"])
+    s2s = full_cfg.get("sim2sim", {})
     if "action_scale" in s2s:
         pcfg["action_scale"] = s2s["action_scale"]
 

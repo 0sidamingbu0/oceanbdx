@@ -255,8 +255,9 @@ python3 sim2sim/mujoco_sim.py \
 部署侧 (`src/policy.cpp` / `sim2sim/mujoco_sim.py`) 假定观测为:
 
 ```
-[ base_ang_vel*0.25, projected_gravity, commands*(2,2,0.25),
-  (dof_pos - default_dof_pos)*1.0, dof_vel*0.05, last_actions ]   共 9+3×10=39 维
+[ base_ang_vel*0.25, projected_gravity, commands*(2,2,1),
+  sin(gait_phase), cos(gait_phase),
+  (dof_pos - default_dof_pos)*1.0, dof_vel*0.05, last_actions ]   共 11+3×10=41 维
 动作: target_q = default_dof_pos + 0.25 * action
 ```
 
