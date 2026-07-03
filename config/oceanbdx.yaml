@@ -84,12 +84,14 @@ oceanbdx:
 
   policy:
     path: policy/policy.onnx   # IsaacLab rsl_rl 导出的 ONNX
-    num_obs: 43                # 低速行走v3: ang_vel3+proj_g3+cmd3+gait_clock2+feet_contact2+Δq10+dq10+last_act10
+    num_obs: 41                # ang_vel3+proj_g3+cmd3+gait_clock2+Δq10+dq10+last_act10
+    # ★ 2026-07-03: 移除观测里的 feet_contact2 (本项目不装足底接触开关, 与训练侧对齐,
+    #   详见 oceanisaaclab changelog/2026-07-03 第8节)。43->41, 须配套重训+重导出 ONNX。
     # 以下缩放必须与 IsaacLab 训练配置一致
     ang_vel_scale: 0.25
     dof_pos_scale: 1.0
     dof_vel_scale: 0.05
-    action_scale: 0.25
+    action_scale: 0.5
     clip_actions: 1.0          # IsaacLab训练侧在env内将action裁剪到[-1, 1]
     clip_obs: 100.0
     commands_scale: [2.0, 2.0, 1.0]
@@ -111,7 +113,7 @@ oceanbdx:
   #   30N 侧推; kd=6 起就侧漂 1m/s 摔倒。故覆盖回训练阻尼, 与真机 control.rl_kd 一致。
   #   (sim2sim 验证: scan_ckpt / debug-push 见 changelog/2026-06-25.md)
   sim2sim:
-    action_scale: 0.25
+    action_scale: 0.5
     rl_kd: [2.5, 2.5, 2.5, 2.5, 2.5,  2.5, 2.5, 2.5, 2.5, 2.5]
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----

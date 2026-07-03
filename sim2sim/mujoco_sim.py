@@ -228,7 +228,7 @@ class Policy:
         self.last_raw_actions[:] = 0
         self.gait_phase = 0.0
 
-    def step(self, q, dq, quat, gyro, cmd, feet_contact):
+    def step(self, q, dq, quat, gyro, cmd):
         c = self.cfg
         cmd = np.asarray(cmd, dtype=np.float32)
         projected_gravity = quat_rotate_inverse_gravity(quat)
@@ -244,14 +244,13 @@ class Policy:
         )
         if not moving:
             gait_clock = np.zeros(2, dtype=np.float32)
-        # 双脚接触布尔量, 顺序 [右, 左] 与训练 _feet_contact_ids(leg_r5, leg_l5) 一致。
-        feet_contact = np.asarray(feet_contact, dtype=np.float32).reshape(2)
+        # 观测不含 feet_contact: 本项目不装足底接触开关, 与训练侧 41 维对齐
+        # (2026-07-03)。接触仅在训练端用于奖励, 非策略输入。
         obs = np.concatenate([
             gyro * c["ang_vel_scale"],
             projected_gravity,
             cmd * self.commands_scale,
             gait_clock,
-            feet_contact,
             (q - self.default_dof_pos) * c["dof_pos_scale"],
             dq * c["dof_vel_scale"],
             self.last_actions,
@@ -461,8 +460,7 @@ class Sim:
         quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         gyro = np.zeros(3, dtype=np.float32)
         cmd = np.zeros(3, dtype=np.float32)
-        feet_contact = np.ones(2, dtype=np.float32)  # 理想站立: 双脚均触地
-        target = self.policy.step(q, dq, quat, gyro, cmd, feet_contact)
+        target = self.policy.step(q, dq, quat, gyro, cmd)
         action = self.policy.last_actions
         raw_action = self.policy.last_raw_actions
         saturated = [LEG_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
@@ -916,13 +914,7 @@ class Sim:
             cmd = self.cmd if self.state == "RL_WALK" else np.zeros(3)
             fresh_policy = self.rl_tick % self.decimation == 0
             if fresh_policy:
-                left_force, right_force = self.foot_contact_forces()
-                # 顺序 [右, 左], 阈值 1N (与 run_debug_push 的离地判定 <1N 一致)
-                feet_contact = np.array(
-                    [1.0 if right_force > 1.0 else 0.0, 1.0 if left_force > 1.0 else 0.0],
-                    dtype=np.float32,
-                )
-                self.rl_target = self.policy.step(q, dq, quat, gyro, cmd, feet_contact)
+                self.rl_target = self.policy.step(q, dq, quat, gyro, cmd)
             self.rl_tick += 1
             target, kp, kd = self.rl_target, self.kp, self.kd
             if fresh_policy and self.run_logger is not None:
