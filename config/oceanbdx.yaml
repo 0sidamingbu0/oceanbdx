@@ -84,7 +84,7 @@ oceanbdx:
 
   policy:
     path: policy/policy.onnx   # IsaacLab rsl_rl 导出的 ONNX
-    num_obs: 41                # 低速行走v2: 39 + gait_clock(sin/cos)
+    num_obs: 43                # 低速行走v3: ang_vel3+proj_g3+cmd3+gait_clock2+feet_contact2+Δq10+dq10+last_act10
     # 以下缩放必须与 IsaacLab 训练配置一致
     ang_vel_scale: 0.25
     dof_pos_scale: 1.0
@@ -94,6 +94,7 @@ oceanbdx:
     clip_obs: 100.0
     commands_scale: [2.0, 2.0, 1.0]
     gait_cycle_period: 0.6
+    move_command_threshold: 0.08  # 命令幅度低于此值视为站立, gait clock 置(0,0)(与训练侧一致)
     # 策略的 default joint pos (训练时 init_state.joint_pos), 站立姿态为全0
     default_dof_pos: [0, 0, 0, 0, 0,  0, 0, 0, 0, 0]
 
