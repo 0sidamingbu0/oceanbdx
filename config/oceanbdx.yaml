@@ -84,21 +84,35 @@ oceanbdx:
 
   policy:
     path: policy/policy.onnx   # IsaacLab rsl_rl 导出的 ONNX
-    num_obs: 41                # ang_vel3+proj_g3+cmd3+gait_clock2+Δq10+dq10+last_act10
-    # ★ 2026-07-03: 移除观测里的 feet_contact2 (本项目不装足底接触开关, 与训练侧对齐,
-    #   详见 oceanisaaclab changelog/2026-07-03 第8节)。43->41, 须配套重训+重导出 ONNX。
+    # ★ 2026-07-06: 路线 B（BDX 论文完整复刻）观测重构为 57 维，旧 41 维布局作废。
+    #   57 = pos_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + Δq10 + dq10
+    #        + a_{t-1}10 + a_{t-2}10 + phase二阶谐波4 + cmd3
+    #   须配套用路线 B 训练+重导出的 onnx（in=[1,57]）。详见 oceanisaaclab
+    #   changelog/2026-07-06。sim2sim/mujoco_sim.py 已同步；C++ src/policy.cpp 待改。
+    num_obs: 57
     # 以下缩放必须与 IsaacLab 训练配置一致
     ang_vel_scale: 0.25
     dof_pos_scale: 1.0
     dof_vel_scale: 0.05
-    action_scale: 0.5
+    action_scale: 0.5          # ★ 路线 B 已弃用（改逐关节 action_joint_ranges 映射），保留字段仅兼容旧代码
     clip_actions: 1.0          # IsaacLab训练侧在env内将action裁剪到[-1, 1]
     clip_obs: 100.0
     commands_scale: [2.0, 2.0, 1.0]
     gait_cycle_period: 0.6
-    move_command_threshold: 0.08  # 命令幅度低于此值视为站立, gait clock 置(0,0)(与训练侧一致)
+    move_command_threshold: 0.08  # 命令幅度低于此值视为站立(path frame 走收敛分支); 相位照常推进不清零
     # 策略的 default joint pos (训练时 init_state.joint_pos), 站立姿态为全0
     default_dof_pos: [0, 0, 0, 0, 0,  0, 0, 0, 0, 0]
+    # ---- 路线 B 新增（须与 oceanisaaclab_walk_env_cfg.py 一致）----
+    pos_pf_scale: 4.0                 # path 系躯干 xy 观测缩放 (≈1/max_pos_deviation)
+    lin_vel_scale: 2.0                # body 系线速度观测缩放
+    forward_vx_sign: -1.0             # +x=头部前向的符号（URDF base +x 指尾部 → head_yaw offset=π）
+    # path frame 状态机参数（论文 V-A / Fig.4；sim2sim 用 MuJoCo 真值驱动）
+    path_frame_stand_time_constant: 1.0   # [s] 站立向双脚中心收敛的一阶时间常数
+    path_frame_max_pos_deviation: 0.25    # [m] path frame 与躯干最大位置偏差（投影拉回）
+    path_frame_max_yaw_deviation: 0.6     # [rad] 最大朝向偏差
+    # 逐关节动作映射：0 → 标称站姿，±1 → ±action_joint_ranges（替换全局 action_scale）
+    # 顺序 [r1..r5, l1..l5] = [髋yaw, 髋roll, 髋pitch, 膝, 踝] × 2
+    action_joint_ranges: [0.35, 0.35, 0.8, 0.9, 0.8,  0.35, 0.35, 0.8, 0.9, 0.8]
 
   command:
     max_vx: 0.5

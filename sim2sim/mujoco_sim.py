@@ -54,6 +54,68 @@ def quat_rotate_inverse_gravity(q):
     ])
 
 
+def yaw_from_quat(q):
+    """从四元数 (w,x,y,z) 取 body +x 在世界系的 yaw（绕 z），与 euler_xyz 的 yaw 分量一致。"""
+    w, x, y, z = q
+    return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def wrap_angle(a):
+    """把角度环绕到 (-π, π]。与训练侧 path_frame.wrap_angle 一致。"""
+    return np.arctan2(np.sin(a), np.cos(a))
+
+
+class PathFrameNP:
+    """path frame（BDX 论文 V-A / Fig.4）的单 env numpy 复刻。
+
+    逐行为对齐训练侧 oceanisaaclab .../path_frame.py：+x 轴=头部前向，行走按 path 系
+    命令积分、站立一阶低通收敛到双脚中心+躯干朝向、最大偏差投影拉回躯干附近。
+    sim2sim 用 MuJoCo 真值驱动（躯干世界 xy/yaw 里程计 + 双脚 FK 中心）；真机侧改由
+    状态估计器提供同样的量（论文 V-D 要求 runtime 与训练逐行为一致）。
+    """
+
+    def __init__(self, stand_time_constant=1.0, max_pos_deviation=0.25, max_yaw_deviation=0.6):
+        self.pos = np.zeros(2)   # 世界系 xy
+        self.yaw = 0.0           # 头部前向朝向（世界系）
+        self.stand_time_constant = float(stand_time_constant)
+        self.max_pos_deviation = float(max_pos_deviation)
+        self.max_yaw_deviation = float(max_yaw_deviation)
+
+    def reset(self, base_pos_xy, head_yaw):
+        self.pos = np.asarray(base_pos_xy, dtype=float).copy()
+        self.yaw = float(head_yaw)
+
+    def step(self, dt, cmd, moving, base_pos_xy, head_yaw, feet_center_xy):
+        cos_y, sin_y = np.cos(self.yaw), np.sin(self.yaw)
+        if moving:
+            # 行走：path 系命令 (vx 头前, vy 头左, wz) 旋到世界系再积分
+            dx_w = cmd[0] * cos_y - cmd[1] * sin_y
+            dy_w = cmd[0] * sin_y + cmd[1] * cos_y
+            self.pos = self.pos + np.array([dx_w, dy_w]) * dt
+            self.yaw = self.yaw + cmd[2] * dt
+        else:
+            # 站立：一阶低通收敛到双脚中心 + 躯干朝向
+            alpha = min(1.0, dt / self.stand_time_constant)
+            self.pos = self.pos + alpha * (np.asarray(feet_center_xy, dtype=float) - self.pos)
+            self.yaw = self.yaw + alpha * wrap_angle(head_yaw - self.yaw)
+        self.yaw = wrap_angle(self.yaw)
+        # 最大偏差投影：把 path frame 拉回躯干附近（位置 + 朝向分别投影）
+        offset = self.pos - np.asarray(base_pos_xy, dtype=float)
+        dist = float(np.linalg.norm(offset))
+        scale = min(1.0, self.max_pos_deviation / max(dist, 1e-6))
+        self.pos = np.asarray(base_pos_xy, dtype=float) + offset * scale
+        yaw_err = wrap_angle(self.yaw - head_yaw)
+        self.yaw = wrap_angle(head_yaw + np.clip(yaw_err, -self.max_yaw_deviation, self.max_yaw_deviation))
+
+    def base_in_path_frame(self, base_pos_xy, head_yaw):
+        """躯干在 path 系中的 xy 位置 (2,) 与相对 yaw（观测用）。"""
+        rel = np.asarray(base_pos_xy, dtype=float) - self.pos
+        cos_y, sin_y = np.cos(self.yaw), np.sin(self.yaw)
+        x_pf = rel[0] * cos_y + rel[1] * sin_y
+        y_pf = -rel[0] * sin_y + rel[1] * cos_y
+        return np.array([x_pf, y_pf]), wrap_angle(head_yaw - self.yaw)
+
+
 class TeleopPanel:
     """Tkinter 关节角拖动面板: 每个关节一个滑块, 实时显示真机读数。
 
@@ -201,7 +263,22 @@ class RealOutputPanel:
 
 
 class Policy:
-    """与 src/policy.cpp 相同的观测构造与动作解码"""
+    """路线 B（BDX 论文复刻）57 维观测构造与逐关节动作解码。
+
+    须与训练侧 oceanisaaclab .../oceanisaaclab_walk_env.py `_get_observations` 逐位一致：
+      [0:2]   pos_pf × pos_pf_scale                path 系躯干 xy
+      [2:4]   (sin, cos) 相对 yaw = head_yaw − path_yaw
+      [4:7]   lin_vel_b × lin_vel_scale            body 系线速度
+      [7:10]  ang_vel_b × ang_vel_scale            body 系角速度（= gyro）
+      [10:20] (q − default) × dof_pos_scale
+      [20:30] dq × dof_vel_scale
+      [30:40] a_{t-1}
+      [40:50] a_{t-2}
+      [50:54] (sin2πφ, cos2πφ, sin4πφ, cos4πφ)     相位二阶谐波
+      [54:57] cmd × commands_scale
+    动作解码：target = default + action_joint_ranges ⊙ clip(a, ±1)（逐关节，不用全局 action_scale）。
+    path frame 状态机（PathFrameNP）由外部用 MuJoCo 真值逐控制步 step() 推进。
+    """
 
     def __init__(self, onnx_path, cfg, num_joints):
         import onnxruntime as ort
@@ -213,57 +290,78 @@ class Policy:
         self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 1.0]), dtype=np.float32)
         self.gait_cycle_period = float(cfg.get("gait_cycle_period", 0.6))
         self.policy_dt = float(cfg.get("policy_dt", 0.05))
-        # 移动判定阈值: 命令幅度低于此值视为站立, gait clock 置 0 (与训练侧一致)
         self.move_command_threshold = float(cfg.get("move_command_threshold", 0.08))
+        # 路线 B 新增缩放/映射
+        self.pos_pf_scale = float(cfg.get("pos_pf_scale", 4.0))
+        self.lin_vel_scale = float(cfg.get("lin_vel_scale", 2.0))
+        self.action_joint_ranges = np.array(
+            cfg.get("action_joint_ranges", [0.35, 0.35, 0.8, 0.9, 0.8] * 2), dtype=np.float32
+        )[:self.nj]
+        # 相位速率 φ̇：恒定步频库即常数 1/period（与训练 sample_phase_rate 在本库上等价）
+        self.phase_rate = 1.0 / max(1.0e-6, self.gait_cycle_period)
         self.gait_phase = 0.0
         self.last_actions = np.zeros(self.nj, dtype=np.float32)
+        self.last_last_actions = np.zeros(self.nj, dtype=np.float32)
         self.last_obs = None
         self.last_projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self.last_raw_actions = np.zeros(self.nj, dtype=np.float32)
 
     def reset(self):
         self.last_actions[:] = 0
+        self.last_last_actions[:] = 0
         self.last_obs = None
         self.last_projected_gravity[:] = [0.0, 0.0, -1.0]
         self.last_raw_actions[:] = 0
         self.gait_phase = 0.0
 
-    def step(self, q, dq, quat, gyro, cmd):
+    def step(self, q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b):
+        """一次策略推理。
+
+        Args:
+            q, dq: (nj,) 关节角/角速度（URDF 系）。
+            gyro: (3,) body 系角速度。
+            cmd: (3,) 头部系速度命令 (vx 前, vy 左, wz)。
+            pos_pf: (2,) 躯干 path 系 xy（PathFrameNP.base_in_path_frame 提供）。
+            yaw_pf: 相对 yaw = head_yaw − path_yaw。
+            lin_vel_b: (3,) body 系线速度（真机来自状态估计器；sim2sim 用 MuJoCo 真值）。
+        """
         c = self.cfg
         cmd = np.asarray(cmd, dtype=np.float32)
-        projected_gravity = quat_rotate_inverse_gravity(quat)
-        gait_clock = np.array([
-            np.sin(2.0 * np.pi * self.gait_phase),
-            np.cos(2.0 * np.pi * self.gait_phase),
+        # 相位积分：φ̇ 恒定步频；站立不清零（与训练侧一致，训练 obs 不对站立屏蔽谐波）。
+        # 训练侧 _pre_physics_step 在 _get_observations 之前推进相位，故 obs 见已推进的 φ。
+        self.gait_phase = (self.gait_phase + self.phase_rate * self.policy_dt) % 1.0
+        two_pi_phase = 2.0 * np.pi * self.gait_phase
+        phase_feat = np.array([
+            np.sin(two_pi_phase),
+            np.cos(two_pi_phase),
+            np.sin(2.0 * two_pi_phase),
+            np.cos(2.0 * two_pi_phase),
         ], dtype=np.float32)
-        # 零速命令下屏蔽 gait clock -> (0,0): 与训练侧一致(站立时时钟静默, 避免策略
-        # 一边被 stand_still 罚踏步、一边看到"该迈步了"的时钟而原地踏步)。相位计数仍
-        # 持续推进, 只是观测里被清零, 恢复移动时相位连续。
-        moving = (float(np.max(np.abs(cmd[:2]))) > self.move_command_threshold) or (
-            abs(float(cmd[2])) > self.move_command_threshold
-        )
-        if not moving:
-            gait_clock = np.zeros(2, dtype=np.float32)
-        # 观测不含 feet_contact: 本项目不装足底接触开关, 与训练侧 41 维对齐
-        # (2026-07-03)。接触仅在训练端用于奖励, 非策略输入。
+        yaw_feat = np.array([np.sin(yaw_pf), np.cos(yaw_pf)], dtype=np.float32)
+
         obs = np.concatenate([
+            np.asarray(pos_pf, dtype=np.float32) * self.pos_pf_scale,
+            yaw_feat,
+            np.asarray(lin_vel_b, dtype=np.float32) * self.lin_vel_scale,
             gyro * c["ang_vel_scale"],
-            projected_gravity,
-            cmd * self.commands_scale,
-            gait_clock,
             (q - self.default_dof_pos) * c["dof_pos_scale"],
             dq * c["dof_vel_scale"],
             self.last_actions,
+            self.last_last_actions,
+            phase_feat,
+            cmd * self.commands_scale,
         ]).astype(np.float32)
-        self.gait_phase = (self.gait_phase + self.policy_dt / self.gait_cycle_period) % 1.0
-        self.last_projected_gravity = projected_gravity.astype(np.float32)
+
         obs = np.clip(obs, -c["clip_obs"], c["clip_obs"])
         self.last_obs = obs.copy()
         act = self.sess.run(None, {self.input_name: obs[None, :]})[0][0]
         self.last_raw_actions = act.astype(np.float32)
         act = np.clip(act, -c["clip_actions"], c["clip_actions"])
+        # 双帧动作历史滚动：先把上一帧移到 t-2，再写入本帧到 t-1
+        self.last_last_actions = self.last_actions.copy()
         self.last_actions = act.astype(np.float32)
-        return self.default_dof_pos + c["action_scale"] * act
+        # 逐关节线性映射：0 → 标称站姿，±1 → ±action_joint_ranges
+        return self.default_dof_pos + self.action_joint_ranges * act
 
 
 class RunLogger:
@@ -416,6 +514,20 @@ class Sim:
             else:
                 print(f"[sim2sim] policy not found at {pol_path}, running script-only mode")
 
+        # ---- 路线 B path frame（论文 V-A）：MuJoCo 真值驱动 ----
+        pcfg_full = full["policy"]
+        # head_yaw offset：forward_vx_sign=-1 → offset=π（URDF base +x 指尾部，头前向=−x）
+        self.forward_vx_sign = float(pcfg_full.get("forward_vx_sign", -1.0))
+        self.head_yaw_offset = 0.0 if self.forward_vx_sign > 0.0 else np.pi
+        self.move_command_threshold = float(pcfg_full.get("move_command_threshold", 0.08))
+        self.path_frame = PathFrameNP(
+            stand_time_constant=float(pcfg_full.get("path_frame_stand_time_constant", 1.0)),
+            max_pos_deviation=float(pcfg_full.get("path_frame_max_pos_deviation", 0.25)),
+            max_yaw_deviation=float(pcfg_full.get("path_frame_max_yaw_deviation", 0.6)),
+        )
+        # 双脚 geom（站立收敛目标 = 双脚中心 FK 真值）
+        self.foot_geom_ids = [self.model.geom("foot_r").id, self.model.geom("foot_l").id]
+
         self.state = "SIT"
         self.state_time = 0.0
         self.cmd = np.zeros(3)
@@ -457,10 +569,13 @@ class Sim:
             return
         q = self.stand_pose.copy()
         dq = np.zeros(self.nj, dtype=np.float32)
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         gyro = np.zeros(3, dtype=np.float32)
         cmd = np.zeros(3, dtype=np.float32)
-        target = self.policy.step(q, dq, quat, gyro, cmd)
+        # 理想直立零命令：path 系躯干位于原点、朝向对齐、线速度 0
+        pos_pf = np.zeros(2, dtype=np.float32)
+        yaw_pf = 0.0
+        lin_vel_b = np.zeros(3, dtype=np.float32)
+        target = self.policy.step(q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b)
         action = self.policy.last_actions
         raw_action = self.policy.last_raw_actions
         saturated = [LEG_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
@@ -581,6 +696,19 @@ class Sim:
         rot_wb = self.data.xmat[base_body_id].reshape(3, 3)
         lin_vel_b = rot_wb.T @ lin_vel_w
         return lin_vel_w, lin_vel_b
+
+    def path_frame_truth(self):
+        """从 MuJoCo 读 path frame 所需真值：躯干 xy、头部 yaw、双脚中心 xy、body 线速度。
+
+        真机侧这些量改由状态估计器/里程计 + FK 提供（论文 V-D 要求 runtime 一致）。
+        """
+        base_xy = self.data.qpos[0:2].copy()
+        head_yaw = yaw_from_quat(self.data.qpos[3:7]) + self.head_yaw_offset
+        feet_center = np.mean(
+            [self.data.geom_xpos[gid, :2] for gid in self.foot_geom_ids], axis=0
+        )
+        _, lin_vel_b = self.base_linear_velocities()
+        return base_xy, head_yaw, feet_center, lin_vel_b
 
     def foot_contact_forces(self):
         left_force = 0.0
@@ -908,13 +1036,25 @@ class Sim:
                     self.policy.reset()
                     self.rl_target = self.stand_pose.copy()
                     self.rl_tick = 0
+                    # path frame 初始化到当前躯干出生位姿（论文：起始于躯干状态）
+                    base_xy, head_yaw, _, _ = self.path_frame_truth()
+                    self.path_frame.reset(base_xy, head_yaw)
                     self.state, self.state_time = "RL_BALANCE", 0.0
                     print("[FSM] STAND_UP -> RL_BALANCE")
         elif self.state in ("RL_BALANCE", "RL_WALK"):
             cmd = self.cmd if self.state == "RL_WALK" else np.zeros(3)
             fresh_policy = self.rl_tick % self.decimation == 0
             if fresh_policy:
-                self.rl_target = self.policy.step(q, dq, quat, gyro, cmd)
+                # path frame 每策略步推进一次（用 MuJoCo 真值；真机侧改状态估计器）
+                base_xy, head_yaw, feet_center, lin_vel_b = self.path_frame_truth()
+                moving = (float(np.max(np.abs(cmd[:2]))) > self.move_command_threshold) or (
+                    abs(float(cmd[2])) > self.move_command_threshold
+                )
+                self.path_frame.step(
+                    self.policy.policy_dt, cmd, moving, base_xy, head_yaw, feet_center
+                )
+                pos_pf, yaw_pf = self.path_frame.base_in_path_frame(base_xy, head_yaw)
+                self.rl_target = self.policy.step(q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b)
             self.rl_tick += 1
             target, kp, kd = self.rl_target, self.kp, self.kd
             if fresh_policy and self.run_logger is not None:
