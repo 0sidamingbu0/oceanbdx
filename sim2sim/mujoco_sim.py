@@ -42,6 +42,8 @@ SCENE_XML = os.path.join(ROOT, "sim2sim/ocean_scene.xml")
 LEG_JOINTS = ["leg_r1_joint", "leg_r2_joint", "leg_r3_joint", "leg_r4_joint", "leg_r5_joint",
               "leg_l1_joint", "leg_l2_joint", "leg_l3_joint", "leg_l4_joint", "leg_l5_joint"]
 NECK_JOINTS = ["neck_n1_joint", "neck_n2_joint", "neck_n3_joint", "neck_n4_joint"]
+# 动作向量顺序 = 腿 10 + 脖子 4（与训练侧 action 布局一致），调试打印按此索引
+ACTION_JOINTS = LEG_JOINTS + NECK_JOINTS
 
 
 def quat_rotate_inverse_gravity(q):
@@ -263,31 +265,43 @@ class RealOutputPanel:
 
 
 class Policy:
-    """路线 B（BDX 论文复刻）57 维观测构造与逐关节动作解码。
+    """路线 B（BDX 论文复刻）77 维观测构造与逐关节动作解码（阶段1：含脖子+头部命令）。
 
     须与训练侧 oceanisaaclab .../oceanisaaclab_walk_env.py `_get_observations` 逐位一致：
       [0:2]   pos_pf × pos_pf_scale                path 系躯干 xy
       [2:4]   (sin, cos) 相对 yaw = head_yaw − path_yaw
       [4:7]   lin_vel_b × lin_vel_scale            body 系线速度
       [7:10]  ang_vel_b × ang_vel_scale            body 系角速度（= gyro）
-      [10:20] (q − default) × dof_pos_scale
-      [20:30] dq × dof_vel_scale
-      [30:40] a_{t-1}
-      [40:50] a_{t-2}
-      [50:54] (sin2πφ, cos2πφ, sin4πφ, cos4πφ)     相位二阶谐波
-      [54:57] cmd × commands_scale
-    动作解码：target = default + action_joint_ranges ⊙ clip(a, ±1)（逐关节，不用全局 action_scale）。
+      [10:20] (q_leg − default) × dof_pos_scale
+      [20:24] q_neck × dof_pos_scale               脖子 4 关节角（无 default 偏移）
+      [24:34] dq_leg × dof_vel_scale
+      [34:38] dq_neck × dof_vel_scale
+      [38:52] a_{t-1}（14：10 腿 + 4 脖子）
+      [52:66] a_{t-2}
+      [66:70] (sin2πφ, cos2πφ, sin4πφ, cos4πφ)     相位二阶谐波
+      [70:73] cmd × commands_scale
+      [73:77] head_cmd × head_command_scale        (Δh, pitch, yaw, roll)
+    动作解码（14 维）：前 10 腿 target = default + action_joint_ranges⊙clip；
+      后 4 脖子 target = neck_default + neck_action_joint_ranges⊙clip。
     path frame 状态机（PathFrameNP）由外部用 MuJoCo 真值逐控制步 step() 推进。
     """
 
-    def __init__(self, onnx_path, cfg, num_joints):
+    def __init__(self, onnx_path, cfg, num_joints, num_neck=4):
         import onnxruntime as ort
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         self.input_name = self.sess.get_inputs()[0].name
         self.cfg = cfg
-        self.nj = num_joints
+        self.nj = num_joints  # 腿关节数（10）
+        self.n_neck = num_neck  # 脖子关节数（4）
+        self.n_act = num_joints + num_neck  # 动作维度（14）
         self.default_dof_pos = np.array(cfg["default_dof_pos"], dtype=np.float32)
+        self.neck_default_dof_pos = np.array(
+            cfg.get("neck_default_dof_pos", [0.0] * num_neck), dtype=np.float32
+        )
         self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 1.0]), dtype=np.float32)
+        self.head_command_scale = np.array(
+            cfg.get("head_command_scale", [20.0, 1.0, 1.0, 1.0]), dtype=np.float32
+        )
         self.gait_cycle_period = float(cfg.get("gait_cycle_period", 0.6))
         self.policy_dt = float(cfg.get("policy_dt", 0.05))
         self.move_command_threshold = float(cfg.get("move_command_threshold", 0.08))
@@ -297,14 +311,17 @@ class Policy:
         self.action_joint_ranges = np.array(
             cfg.get("action_joint_ranges", [0.35, 0.35, 0.8, 0.9, 0.8] * 2), dtype=np.float32
         )[:self.nj]
+        self.neck_action_joint_ranges = np.array(
+            cfg.get("neck_action_joint_ranges", [0.8, 0.8, 1.2, 0.7]), dtype=np.float32
+        )[:self.n_neck]
         # 相位速率 φ̇：恒定步频库即常数 1/period（与训练 sample_phase_rate 在本库上等价）
         self.phase_rate = 1.0 / max(1.0e-6, self.gait_cycle_period)
         self.gait_phase = 0.0
-        self.last_actions = np.zeros(self.nj, dtype=np.float32)
-        self.last_last_actions = np.zeros(self.nj, dtype=np.float32)
+        self.last_actions = np.zeros(self.n_act, dtype=np.float32)
+        self.last_last_actions = np.zeros(self.n_act, dtype=np.float32)
         self.last_obs = None
         self.last_projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-        self.last_raw_actions = np.zeros(self.nj, dtype=np.float32)
+        self.last_raw_actions = np.zeros(self.n_act, dtype=np.float32)
 
     def reset(self):
         self.last_actions[:] = 0
@@ -314,19 +331,26 @@ class Policy:
         self.last_raw_actions[:] = 0
         self.gait_phase = 0.0
 
-    def step(self, q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b):
+    def step(self, q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b,
+             neck_q, neck_dq, head_cmd):
         """一次策略推理。
 
         Args:
-            q, dq: (nj,) 关节角/角速度（URDF 系）。
+            q, dq: (nj,) 腿关节角/角速度（URDF 系）。
             gyro: (3,) body 系角速度。
             cmd: (3,) 头部系速度命令 (vx 前, vy 左, wz)。
             pos_pf: (2,) 躯干 path 系 xy（PathFrameNP.base_in_path_frame 提供）。
             yaw_pf: 相对 yaw = head_yaw − path_yaw。
             lin_vel_b: (3,) body 系线速度（真机来自状态估计器；sim2sim 用 MuJoCo 真值）。
+            neck_q, neck_dq: (n_neck,) 脖子关节角/角速度。
+            head_cmd: (4,) 头部命令 (Δh, pitch, yaw, roll)。
+
+        Returns:
+            (leg_target(nj,), neck_target(n_neck,))。
         """
         c = self.cfg
         cmd = np.asarray(cmd, dtype=np.float32)
+        head_cmd = np.asarray(head_cmd, dtype=np.float32)
         # 相位积分：φ̇ 恒定步频；站立不清零（与训练侧一致，训练 obs 不对站立屏蔽谐波）。
         # 训练侧 _pre_physics_step 在 _get_observations 之前推进相位，故 obs 见已推进的 φ。
         self.gait_phase = (self.gait_phase + self.phase_rate * self.policy_dt) % 1.0
@@ -345,11 +369,14 @@ class Policy:
             np.asarray(lin_vel_b, dtype=np.float32) * self.lin_vel_scale,
             gyro * c["ang_vel_scale"],
             (q - self.default_dof_pos) * c["dof_pos_scale"],
+            np.asarray(neck_q, dtype=np.float32) * c["dof_pos_scale"],
             dq * c["dof_vel_scale"],
+            np.asarray(neck_dq, dtype=np.float32) * c["dof_vel_scale"],
             self.last_actions,
             self.last_last_actions,
             phase_feat,
             cmd * self.commands_scale,
+            head_cmd * self.head_command_scale,
         ]).astype(np.float32)
 
         obs = np.clip(obs, -c["clip_obs"], c["clip_obs"])
@@ -360,8 +387,10 @@ class Policy:
         # 双帧动作历史滚动：先把上一帧移到 t-2，再写入本帧到 t-1
         self.last_last_actions = self.last_actions.copy()
         self.last_actions = act.astype(np.float32)
-        # 逐关节线性映射：0 → 标称站姿，±1 → ±action_joint_ranges
-        return self.default_dof_pos + self.action_joint_ranges * act
+        # 逐关节线性映射：腿 0→标称站姿；脖子 0→默认位（±range）
+        leg_target = self.default_dof_pos + self.action_joint_ranges * act[:self.nj]
+        neck_target = self.neck_default_dof_pos + self.neck_action_joint_ranges * act[self.nj:]
+        return leg_target, neck_target
 
 
 class RunLogger:
@@ -509,7 +538,7 @@ class Sim:
                     pcfg["action_scale"] = sim2sim_ctrl["action_scale"]
                 if getattr(args, "sim_action_scale", None) is not None:
                     pcfg["action_scale"] = float(args.sim_action_scale)
-                self.policy = Policy(pol_path, pcfg, self.nj)
+                self.policy = Policy(pol_path, pcfg, self.nj, num_neck=len(NECK_JOINTS))
                 print(f"[sim2sim] policy loaded: {pol_path}")
             else:
                 print(f"[sim2sim] policy not found at {pol_path}, running script-only mode")
@@ -527,6 +556,23 @@ class Sim:
         )
         # 双脚 geom（站立收敛目标 = 双脚中心 FK 真值）
         self.foot_geom_ids = [self.model.geom("foot_r").id, self.model.geom("foot_l").id]
+
+        # ---- 2026-07-08 脖子/头部命令 ----
+        self.n_neck = len(NECK_JOINTS)
+        self.head_cmd = np.zeros(4, dtype=np.float32)  # (Δh, pitch, yaw, roll)
+        cmd_cfg = full.get("command", {})
+        self.max_head = np.array([
+            float(cmd_cfg.get("max_head_dh", 0.02)),
+            float(cmd_cfg.get("max_head_pitch", 0.5)),
+            float(cmd_cfg.get("max_head_yaw", 1.0)),
+            float(cmd_cfg.get("max_head_roll", 0.6)),
+        ], dtype=np.float32)
+        self.neck_kp = float(pcfg_full.get("neck_kp", 50.0))
+        self.neck_kd = float(pcfg_full.get("neck_kd", 2.0))
+        neck_default = pcfg_full.get("neck_default_dof_pos", [0.0] * self.n_neck)
+        self.neck_default = np.array(neck_default, dtype=np.float32)
+        # 脖子位置目标（策略输出，RL 前锁默认位）
+        self.neck_target = self.neck_default.copy()
 
         self.state = "SIT"
         self.state_time = 0.0
@@ -575,12 +621,17 @@ class Sim:
         pos_pf = np.zeros(2, dtype=np.float32)
         yaw_pf = 0.0
         lin_vel_b = np.zeros(3, dtype=np.float32)
-        target = self.policy.step(q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b)
+        neck_q = np.zeros(self.n_neck, dtype=np.float32)
+        neck_dq = np.zeros(self.n_neck, dtype=np.float32)
+        head_cmd = np.zeros(4, dtype=np.float32)
+        target, _neck_target = self.policy.step(
+            q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b, neck_q, neck_dq, head_cmd
+        )
         action = self.policy.last_actions
         raw_action = self.policy.last_raw_actions
-        saturated = [LEG_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
+        saturated = [ACTION_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
         active = np.argsort(-np.abs(action))[:4]
-        active_text = ", ".join(f"{LEG_JOINTS[i]}={action[i]:+.3f}" for i in active)
+        active_text = ", ".join(f"{ACTION_JOINTS[i]}={action[i]:+.3f}" for i in active)
         saturated_text = ",".join(saturated) if saturated else "none"
         print(
             "[probe_policy] ideal_zero_stand "
@@ -613,6 +664,8 @@ class Sim:
         self.last_target = self.sit_pose.copy()
         self.last_kp = self.fixed_kp.copy()
         self.last_kd = self.fixed_kd.copy()
+        self.neck_target = self.neck_default.copy()
+        self.head_cmd[:] = 0.0
         if self.policy:
             self.policy.reset()
         print("[sim2sim] reset to SIT")
@@ -641,8 +694,8 @@ class Sim:
             obs_min = float(np.min(obs)) if obs is not None else 0.0
             obs_max = float(np.max(obs)) if obs is not None else 0.0
         else:
-            raw_action = np.zeros(self.nj)
-            action = np.zeros(self.nj)
+            raw_action = np.zeros(self.n_neck + self.nj)
+            action = np.zeros(self.n_neck + self.nj)
             obs_min = 0.0
             obs_max = 0.0
 
@@ -671,9 +724,9 @@ class Sim:
         if self.debug_actions:
             active = np.argsort(-np.abs(action))[:4]
             active_text = ", ".join(
-                f"{LEG_JOINTS[i]}={action[i]:+.3f}" for i in active
+                f"{ACTION_JOINTS[i]}={action[i]:+.3f}" for i in active
             )
-            saturated = [LEG_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
+            saturated = [ACTION_JOINTS[i] for i, value in enumerate(np.abs(action)) if value > 0.98]
             saturated_text = ",".join(saturated) if saturated else "none"
             print(
                 "[debug_action_summary] "
@@ -921,11 +974,34 @@ class Sim:
             self.cmd[2] = min(self.cmd[2] + 0.1, self.max_vel[2])
         elif c == "e":
             self.cmd[2] = max(self.cmd[2] - 0.1, -self.max_vel[2])
+        # ---- 头部命令（RL_BALANCE / RL_WALK 均生效，脖子随时可动）----
+        # i/k=点头pitch± j/l=摇头yaw± u/o=歪头roll± n/m=头高± h=头命令清零
+        elif c == "i":
+            self.head_cmd[1] = min(self.head_cmd[1] + 0.1, self.max_head[1])
+        elif c == "k":
+            self.head_cmd[1] = max(self.head_cmd[1] - 0.1, -self.max_head[1])
+        elif c == "j":
+            self.head_cmd[2] = min(self.head_cmd[2] + 0.1, self.max_head[2])
+        elif c == "l":
+            self.head_cmd[2] = max(self.head_cmd[2] - 0.1, -self.max_head[2])
+        elif c == "u":
+            self.head_cmd[3] = min(self.head_cmd[3] + 0.1, self.max_head[3])
+        elif c == "o":
+            self.head_cmd[3] = max(self.head_cmd[3] - 0.1, -self.max_head[3])
+        elif c == "n":
+            self.head_cmd[0] = min(self.head_cmd[0] + 0.005, self.max_head[0])
+        elif c == "m":
+            self.head_cmd[0] = max(self.head_cmd[0] - 0.005, -self.max_head[0])
+        elif c == "h":
+            self.head_cmd[:] = 0.0
         else:
             return
         if c in "wsadqex":
             tag = "" if self.state == "RL_WALK" else "  (仅 RL_WALK 生效, 先按2)"
             print(f"cmd = vx={self.cmd[0]:+.2f} vy={self.cmd[1]:+.2f} wz={self.cmd[2]:+.2f}{tag}")
+        if c in "ikjluonmh":
+            print(f"head_cmd = Δh={self.head_cmd[0]:+.3f} pitch={self.head_cmd[1]:+.2f} "
+                  f"yaw={self.head_cmd[2]:+.2f} roll={self.head_cmd[3]:+.2f}")
 
     # ---------- 真机输出 ----------
     def disable_real_output(self, reason=""):
@@ -1054,7 +1130,12 @@ class Sim:
                     self.policy.policy_dt, cmd, moving, base_xy, head_yaw, feet_center
                 )
                 pos_pf, yaw_pf = self.path_frame.base_in_path_frame(base_xy, head_yaw)
-                self.rl_target = self.policy.step(q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b)
+                neck_q = self.data.qpos[self.neck_q_adr].copy()
+                neck_dq = self.data.qvel[self.neck_v_adr].copy()
+                self.rl_target, self.neck_target = self.policy.step(
+                    q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b,
+                    neck_q, neck_dq, self.head_cmd,
+                )
             self.rl_tick += 1
             target, kp, kd = self.rl_target, self.kp, self.kd
             if fresh_policy and self.run_logger is not None:
@@ -1078,10 +1159,15 @@ class Sim:
         tau = kp * (target - q) - kd * dq
         tau = np.clip(tau, -self.tau_limit, self.tau_limit)
 
-        # 脖子: 锁定零位 (脖子暂不参与控制)
+        # 脖子: RL 状态下位置伺服跟随策略输出的脖子目标（阶段1 起脖子参与控制），
+        # 其余状态锁默认位。增益对齐训练侧 neck ImplicitActuator（kp50/kd2）。
         neck_q = self.data.qpos[self.neck_q_adr]
         neck_dq = self.data.qvel[self.neck_v_adr]
-        neck_tau = 5.0 * (0.0 - neck_q) - 0.5 * neck_dq
+        if self.state in ("RL_BALANCE", "RL_WALK"):
+            neck_ref = self.neck_target
+        else:
+            neck_ref = self.neck_default
+        neck_tau = self.neck_kp * (neck_ref - neck_q) - self.neck_kd * neck_dq
 
         return tau, neck_tau
 

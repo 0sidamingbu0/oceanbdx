@@ -85,11 +85,15 @@ oceanbdx:
   policy:
     path: policy/policy.onnx   # IsaacLab rsl_rl 导出的 ONNX
     # ★ 2026-07-06: 路线 B（BDX 论文完整复刻）观测重构为 57 维，旧 41 维布局作废。
-    #   57 = pos_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + Δq10 + dq10
-    #        + a_{t-1}10 + a_{t-2}10 + phase二阶谐波4 + cmd3
-    #   须配套用路线 B 训练+重导出的 onnx（in=[1,57]）。详见 oceanisaaclab
-    #   changelog/2026-07-06。sim2sim/mujoco_sim.py 已同步；C++ src/policy.cpp 待改。
-    num_obs: 57
+    # ★ 2026-07-08: 阶段1 加脖子+4-DOF头部命令 → 观测扩到 77 维、动作 10→14（后 4=脖子
+    #   位置目标）。57 维布局作废。
+    #   77 = pos_pf2 + yaw_pf(sin,cos)2 + lin_vel_b3 + ang_vel_b3 + Δq_leg10 + q_neck4
+    #        + dq_leg10 + dq_neck4 + a_{t-1}14 + a_{t-2}14 + phase二阶谐波4 + cmd3 + head_cmd4
+    #   注意脖子 q 未减 default（训练侧 neck 无 default 偏移，直接用 q_neck）。
+    #   须配套用阶段1 训练+重导出的 onnx（in=[1,77], out=[1,14]）。详见 oceanisaaclab
+    #   changelog/2026-07-08。sim2sim/mujoco_sim.py 已同步；C++ src/policy.cpp 待改。
+    num_obs: 77
+    num_act: 14                # 10 腿 + 4 脖子
     # 以下缩放必须与 IsaacLab 训练配置一致
     ang_vel_scale: 0.25
     dof_pos_scale: 1.0
@@ -113,11 +117,26 @@ oceanbdx:
     # 逐关节动作映射：0 → 标称站姿，±1 → ±action_joint_ranges（替换全局 action_scale）
     # 顺序 [r1..r5, l1..l5] = [髋yaw, 髋roll, 髋pitch, 膝, 踝] × 2
     action_joint_ranges: [0.35, 0.35, 0.8, 0.9, 0.8,  0.35, 0.35, 0.8, 0.9, 0.8]
+    # ---- 2026-07-08 脖子/头部（须与 oceanisaaclab_walk_env_cfg.py 一致）----
+    # 脖子动作映射：动作后 4 维 → 脖子位置目标 = neck_default(0) + range·clip(a,±1)
+    # 顺序 [n1, n2, n3, n4] = [矢状pitch/高度对×2, yaw, roll]
+    neck_action_joint_ranges: [0.8, 0.8, 1.2, 0.7]
+    neck_default_dof_pos: [0, 0, 0, 0]
+    # 头部命令 4-DOF (Δh 头高, pitch 点头, yaw 摇头, roll 歪头)；obs 尾部 head_cmd×head_command_scale
+    head_command_scale: [20.0, 1.0, 1.0, 1.0]
+    # 脖子位置伺服增益（对齐训练侧 neck ImplicitActuator stiffness50/damping2）
+    neck_kp: 50.0
+    neck_kd: 2.0
 
   command:
     max_vx: 0.5
     max_vy: 0.3
     max_wz: 0.8
+    # 头部命令范围（与训练侧 head_command_*_range 一致；键盘微调步长见 mujoco_sim）
+    max_head_dh: 0.02
+    max_head_pitch: 0.5
+    max_head_yaw: 1.0
+    max_head_roll: 0.6
 
   # ---- MuJoCo sim2sim 专用覆盖 ----
   # Isaac Lab 训练使用 implicit actuator，MuJoCo 这里用显式 torque PD。

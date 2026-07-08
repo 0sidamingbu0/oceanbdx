@@ -2,3 +2,9 @@ WARNING Fri Jun 26 15:29:42 2026: Nan, Inf or huge value in QPOS at DOF 0. The s
 
 WARNING Wed Jul  1 23:13:46 2026: Nan, Inf or huge value in QPOS at DOF 0. The simulation is unstable. Time = 0.0010.
 
+ERROR mj_copyDataVisual (engine_io.c:1162) Tue Jul  7 16:19:11 2026: attempting to copy mjData while stack is in use
+
+WARNING Tue Jul  7 21:14:04 2026: Nan, Inf or huge value in QPOS at DOF 0. The simulation is unstable. Time = 0.0010.
+
+ERROR mj_copyDataVisual (engine_io.c:1162) Tue Jul  7 21:14:04 2026: attempting to copy mjData while stack is in use
+
