@@ -12,9 +12,9 @@
 - 双腿各一路 USB转485, 每腿 5×宇树 GO-M8010-6
 - IMU: YIS320, 一路USB转串口
 - 脖子: 1×M8010 + 3×飞特舵机 (驱动已移植, 控制暂不实现)
-- 状态机: `PASSIVE → SIT_ALIGN(脚本回蹲姿) → BOOT_CHECK(坐姿校验) → SIT_HOLD → STAND_UP(脚本) → RL_BALANCE → RL_WALK`, 任意状态可进 `DAMPING` 软停
+- 状态机: `PASSIVE → SIT_ALIGN(脚本回蹲姿) → BOOT_CHECK(坐姿校验) → SIT_HOLD → STAND_UP(脚本) → RL_STAND(站立模型) ⇄ RL_WALK(行走模型)`, 任意状态可进 `DAMPING` 软停
 - 电机零位=结构限位, URDF零位=站立姿态, 偏移由 `config/oceanbdx.yaml` 的 `calibration` 段管理
-- 策略: IsaacLab 导出 ONNX, C++ onnxruntime 推理
+- 策略: 论文 divide-and-conquer **两个独立 ONNX**——站立 `policy/stand/policy.onnx`(74维观测) 与行走 `policy/policy.onnx`(77维观测), 运行时按需切换; IsaacLab 导出, sim2sim/C++ onnxruntime 推理 (★C++ 侧双模型通路待改, 见 changelog)
 
 ## 目录结构
 
@@ -26,7 +26,7 @@ config/            机器人配置 + udev规则
 description/       ocean URDF + meshes
 sim2sim/           MuJoCo 仿真验证
 scripts/           urdf2mjcf转换、零位测量工具
-policy/            放置训练导出的 policy.onnx
+policy/            训练导出的 ONNX: policy.onnx(行走) + stand/policy.onnx(站立)
 docs/              方案架构文档
 changelog/         每日修改履历 (见下方约定)
 ```
@@ -72,7 +72,9 @@ python3 scripts/measure_offset.py              # 7. URDF可视化测零位偏移
 pip install -r sim2sim/requirements.txt
 python3 scripts/urdf2mjcf.py                  # 生成 sim2sim/ocean_scene.xml
 python3 sim2sim/mujoco_sim.py --no-policy     # 仅验证起立脚本
-python3 sim2sim/mujoco_sim.py                 # 加载 policy/policy.onnx 完整验证
+python3 sim2sim/mujoco_sim.py                 # 同时加载行走+站立两个 ONNX 完整验证
+# 站立/行走是两个独立模型: 起立(1)后进站立模型, 按 2 切行走模型, 按 1 切回站立模型
+python3 sim2sim/mujoco_sim.py --stand-policy policy/stand/policy.onnx   # 覆盖站立 onnx 路径
 ```
 
 > **跑 IsaacLab / 需要 torch 的脚本时(如 `sim2sim/scan_ckpt.py`、`export_ckpt_onnx.py`),用 IsaacLab 运行时 python:**
@@ -83,8 +85,10 @@ python3 sim2sim/mujoco_sim.py                 # 加载 policy/policy.onnx 完整
 > `mujoco_sim.py --probe-policy` / `--debug-push-steps` 等纯推理工具用 base 的 `python3` 即可(只需 mujoco+onnxruntime)。
 
 键盘 (★聚焦运行脚本的**终端窗口**操作, 与真机 main.cpp 一致, 不会触发 MuJoCo 自带快捷键):
-`0`蹲姿 `1`起立 `2`行走 `3`回平衡 `9`阻尼 `r`重置 `p`真机电机开关；
-`w/s`=vx± `a/d`=vy± `q/e`=wz± `x`速度清零 (速度仅在 `2` 行走态生效)。
+`0`蹲姿 `1`起立/切站立模型 `2`切行走模型 `3`切站立模型(同1) `9`阻尼 `r`重置 `p`真机电机开关；
+`w/s`=vx± `a/d`=vy± `q/e`=wz± `x`速度清零 (速度仅在 `2` 行走模型态生效)；
+`t/g`=躯干pitch± `v/c`=躯干yaw± `y/b`=躯干roll± `f/z`=躯干高度± (仅 `1` 站立模型态生效)；
+`i/k`=点头 `j/l`=摇头 `u/o`=歪头 `n/m`=头高 `h`=头命令清零 (站立/行走均生效)。
 MuJoCo 窗口内也能按 (方向键映射到 w/s/q/e), 但数字键会附带触发 MuJoCo 的 geomgroup 切换, 故脚本每帧复位可见组防止机器人消失; 推荐还是用终端操作。
 
 sim2sim 与 IsaacLab 不一致时, 尤其是外力后单脚支撑发散、横漂或动作饱和, 先看 [docs/architecture.md](docs/architecture.md) 的 “sim2sim kd 调试记录”。

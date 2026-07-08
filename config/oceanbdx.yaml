@@ -83,7 +83,14 @@ oceanbdx:
     damping_kd: 3.0            # 阻尼保护 kd
 
   policy:
-    path: policy/policy.onnx   # IsaacLab rsl_rl 导出的 ONNX
+    path: policy/policy.onnx   # 行走模型 (RL_WALK): IsaacLab rsl_rl 导出的 77 维 ONNX
+    # ★ 2026-07-08: 站立模型 (RL_STAND) 是独立训练/导出的 ONNX (74 维观测)。
+    #   起立完成后自动进入 RL_STAND 加载此模型; 键盘 1=切站立模型, 2=切行走模型。
+    #   74 维 = pos_pf2 + yaw_pf2 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4
+    #          + dq_leg10 + dq_neck4 + a_{t-1}14 + a_{t-2}14 + torso_cmd4 + head_cmd4
+    #   (相对行走 77 维: 去 phase 二阶谐波4, cmd3 换成 torso_cmd4)。动作解码同行走。
+    #   对应训练侧 Ocean-BDX-StandPaper-Direct-v0 (oceanisaaclab_stand_env)。
+    stand_path: policy/stand/policy.onnx   # 站立模型 ONNX
     # ★ 2026-07-06: 路线 B（BDX 论文完整复刻）观测重构为 57 维，旧 41 维布局作废。
     # ★ 2026-07-08: 阶段1 加脖子+4-DOF头部命令 → 观测扩到 77 维、动作 10→14（后 4=脖子
     #   位置目标）。57 维布局作废。
@@ -124,6 +131,10 @@ oceanbdx:
     neck_default_dof_pos: [0, 0, 0, 0]
     # 头部命令 4-DOF (Δh 头高, pitch 点头, yaw 摇头, roll 歪头)；obs 尾部 head_cmd×head_command_scale
     head_command_scale: [20.0, 1.0, 1.0, 1.0]
+    # ---- 站立模型专用 (须与 oceanisaaclab_stand_env_cfg.py 一致) ----
+    # 躯干命令 4-DOF (h 躯干高度, pitch 前后倾, yaw 原地偏航, roll 侧倾)；
+    # obs 尾部 torso_cmd×torso_command_scale (h 量级小→放大到与角度可比)。
+    torso_command_scale: [10.0, 1.0, 1.0, 1.0]
     # 脖子位置伺服增益（对齐训练侧 neck ImplicitActuator stiffness50/damping2）
     neck_kp: 50.0
     neck_kd: 2.0

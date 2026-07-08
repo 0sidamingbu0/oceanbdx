@@ -2,11 +2,14 @@
 """
 OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 
-复刻真实机器人的状态机最小闭环: SIT -> STAND_UP(脚本插值) -> RL_BALANCE -> RL_WALK
+复刻真实机器人的状态机最小闭环: SIT -> STAND_UP(脚本插值) -> RL_STAND(站立模型) <-> RL_WALK(行走模型)
+★ 站立与行走是两个独立训练/导出的 ONNX 模型 (policy/stand/policy.onnx 与 policy/policy.onnx)：
+  - 起立完成后自动进入 RL_STAND, 加载站立模型 (74 维观测, torso 位姿命令, 无相位);
+  - 按 2 切到行走模型 (RL_WALK, 77 维观测, 速度命令 + 相位); 按 1 切回站立模型。
 观测/动作处理与 C++ 部署代码 (src/policy.cpp) 完全一致, 用于在上真机前验证:
-  - IsaacLab 导出的 policy.onnx 正确性
+  - IsaacLab 导出的两个 policy.onnx 正确性
   - 观测顺序/缩放/默认关节角配置正确性
-  - 起立脚本与RL切换的衔接
+  - 起立脚本与RL切换的衔接、站立/行走模型互切
 
 用法 (在 oceanbdx 根目录):
     python3 sim2sim/mujoco_sim.py [--policy policy/policy.onnx] [--config config/oceanbdx.yaml]
@@ -19,10 +22,12 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
     # 并在终端刷新 state/cmd/高度/倾斜/速度/|act|max/饱和数; 用 --no-log 关闭。
 
 键盘 (★推荐聚焦“终端窗口”操作, 与真机 main.cpp 一致, 不触发 MuJoCo 快捷键):
-    0 = 真机缓慢到蹲姿   1 = 起立   2 = 行走   3 = 回平衡   9 = 阻尼   r = 重置
+    0 = 真机缓慢到蹲姿   1 = 起立/切站立模型   2 = 切行走模型   3 = 切站立模型(同1)   9 = 阻尼   r = 重置
     p = 真机电机输出开关
     w/s = vx±0.1   a/d = vy±0.1   q/e = wz±0.1   x = 速度清零
-    (速度指令仅在 RL_WALK 状态生效, 先按 2 进入行走)
+    (速度指令仅在 RL_WALK 行走模型生效, 先按 2 进入行走)
+    t/g = 躯干pitch±   v/c = 躯干yaw±   y/b = 躯干roll±   f/z = 躯干高度±
+    (躯干位姿命令仅在 RL_STAND 站立模型生效, 先按 1 进入站立)
     MuJoCo 窗口内也可按同样的键(方向键映射到 w/s/q/e), 但数字键会附带触发
     MuJoCo 自带 geomgroup 切换, 已每帧复位防止机器人 geom 被隐藏。
 """
@@ -286,7 +291,7 @@ class Policy:
     path frame 状态机（PathFrameNP）由外部用 MuJoCo 真值逐控制步 step() 推进。
     """
 
-    def __init__(self, onnx_path, cfg, num_joints, num_neck=4):
+    def __init__(self, onnx_path, cfg, num_joints, num_neck=4, stand=False):
         import onnxruntime as ort
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         self.input_name = self.sess.get_inputs()[0].name
@@ -294,11 +299,19 @@ class Policy:
         self.nj = num_joints  # 腿关节数（10）
         self.n_neck = num_neck  # 脖子关节数（4）
         self.n_act = num_joints + num_neck  # 动作维度（14）
+        # stand=True：独立训练的站立（perpetual）模型。观测去相位谐波、命令由
+        #   (cmd3 行走速度) 换成 (torso4 躯干位姿命令 h,pitch,yaw,roll)，共 74 维；
+        #   动作解码与行走完全一致。stand=False：行走模型，77 维（含 phase4 + cmd3）。
+        self.stand = bool(stand)
         self.default_dof_pos = np.array(cfg["default_dof_pos"], dtype=np.float32)
         self.neck_default_dof_pos = np.array(
             cfg.get("neck_default_dof_pos", [0.0] * num_neck), dtype=np.float32
         )
         self.commands_scale = np.array(cfg.get("commands_scale", [2.0, 2.0, 1.0]), dtype=np.float32)
+        # 站立命令缩放 (h_torso, pitch, yaw, roll)；h 量级小，放大到与角度可比。
+        self.torso_command_scale = np.array(
+            cfg.get("torso_command_scale", [10.0, 1.0, 1.0, 1.0]), dtype=np.float32
+        )
         self.head_command_scale = np.array(
             cfg.get("head_command_scale", [20.0, 1.0, 1.0, 1.0]), dtype=np.float32
         )
@@ -332,18 +345,19 @@ class Policy:
         self.gait_phase = 0.0
 
     def step(self, q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b,
-             neck_q, neck_dq, head_cmd):
-        """一次策略推理。
+             neck_q, neck_dq, head_cmd, torso_cmd=None):
+        """一次策略推理（行走 77 维 / 站立 74 维，由 self.stand 决定观测尾部）。
 
         Args:
             q, dq: (nj,) 腿关节角/角速度（URDF 系）。
             gyro: (3,) body 系角速度。
-            cmd: (3,) 头部系速度命令 (vx 前, vy 左, wz)。
+            cmd: (3,) 行走头部系速度命令 (vx 前, vy 左, wz)；站立模型不使用。
             pos_pf: (2,) 躯干 path 系 xy（PathFrameNP.base_in_path_frame 提供）。
             yaw_pf: 相对 yaw = head_yaw − path_yaw。
             lin_vel_b: (3,) body 系线速度（真机来自状态估计器；sim2sim 用 MuJoCo 真值）。
             neck_q, neck_dq: (n_neck,) 脖子关节角/角速度。
             head_cmd: (4,) 头部命令 (Δh, pitch, yaw, roll)。
+            torso_cmd: (4,) 站立躯干命令 (h, pitch, yaw, roll)；仅站立模型使用。
 
         Returns:
             (leg_target(nj,), neck_target(n_neck,))。
@@ -351,19 +365,10 @@ class Policy:
         c = self.cfg
         cmd = np.asarray(cmd, dtype=np.float32)
         head_cmd = np.asarray(head_cmd, dtype=np.float32)
-        # 相位积分：φ̇ 恒定步频；站立不清零（与训练侧一致，训练 obs 不对站立屏蔽谐波）。
-        # 训练侧 _pre_physics_step 在 _get_observations 之前推进相位，故 obs 见已推进的 φ。
-        self.gait_phase = (self.gait_phase + self.phase_rate * self.policy_dt) % 1.0
-        two_pi_phase = 2.0 * np.pi * self.gait_phase
-        phase_feat = np.array([
-            np.sin(two_pi_phase),
-            np.cos(two_pi_phase),
-            np.sin(2.0 * two_pi_phase),
-            np.cos(2.0 * two_pi_phase),
-        ], dtype=np.float32)
         yaw_feat = np.array([np.sin(yaw_pf), np.cos(yaw_pf)], dtype=np.float32)
 
-        obs = np.concatenate([
+        # 观测公共块（行走/站立一致，66 维）：path 系位姿 + 速度 + 关节 + 双帧动作历史。
+        obs_common = [
             np.asarray(pos_pf, dtype=np.float32) * self.pos_pf_scale,
             yaw_feat,
             np.asarray(lin_vel_b, dtype=np.float32) * self.lin_vel_scale,
@@ -374,10 +379,35 @@ class Policy:
             np.asarray(neck_dq, dtype=np.float32) * c["dof_vel_scale"],
             self.last_actions,
             self.last_last_actions,
-            phase_feat,
-            cmd * self.commands_scale,
-            head_cmd * self.head_command_scale,
-        ]).astype(np.float32)
+        ]
+
+        if self.stand:
+            # 站立尾部：torso_cmd4 + head_cmd4（无相位谐波，共 74 维）。
+            if torso_cmd is None:
+                torso_cmd = np.zeros(4, dtype=np.float32)
+            obs_tail = [
+                np.asarray(torso_cmd, dtype=np.float32) * self.torso_command_scale,
+                head_cmd * self.head_command_scale,
+            ]
+        else:
+            # 行走尾部：phase 二阶谐波4 + cmd3 + head_cmd4（共 77 维）。
+            # 相位积分：φ̇ 恒定步频；站立不清零（训练 obs 不对站立屏蔽谐波）。
+            # 训练侧 _pre_physics_step 在 _get_observations 之前推进相位，obs 见已推进的 φ。
+            self.gait_phase = (self.gait_phase + self.phase_rate * self.policy_dt) % 1.0
+            two_pi_phase = 2.0 * np.pi * self.gait_phase
+            phase_feat = np.array([
+                np.sin(two_pi_phase),
+                np.cos(two_pi_phase),
+                np.sin(2.0 * two_pi_phase),
+                np.cos(2.0 * two_pi_phase),
+            ], dtype=np.float32)
+            obs_tail = [
+                phase_feat,
+                cmd * self.commands_scale,
+                head_cmd * self.head_command_scale,
+            ]
+
+        obs = np.concatenate(obs_common + obs_tail).astype(np.float32)
 
         obs = np.clip(obs, -c["clip_obs"], c["clip_obs"])
         self.last_obs = obs.copy()
@@ -526,22 +556,40 @@ class Sim:
         self.last_kp = self.fixed_kp.copy()
         self.last_kd = self.fixed_kd.copy()
 
-        self.policy = None
+        # 两个独立模型：行走 (RL_WALK, 77 维) 与站立 (RL_STAND, 74 维)。
+        # self.walk_policy / self.stand_policy 分别加载；self.policy 始终指向"当前
+        # 活动模型"(在 control_step 里按状态切换)，供调试/日志/reset 复用。
+        self.walk_policy = None
+        self.stand_policy = None
         if not args.no_policy:
-            pol_path = args.policy or os.path.join(ROOT, full["policy"]["path"])
-            if os.path.exists(pol_path):
-                pcfg = dict(full["policy"])
-                pcfg["default_dof_pos"] = pcfg["default_dof_pos"][:self.nj]
-                pcfg["policy_dt"] = float(full["control"]["dt"]) * int(full["control"]["decimation"])
-                sim2sim_ctrl = full.get("sim2sim", {})
-                if "action_scale" in sim2sim_ctrl:
-                    pcfg["action_scale"] = sim2sim_ctrl["action_scale"]
-                if getattr(args, "sim_action_scale", None) is not None:
-                    pcfg["action_scale"] = float(args.sim_action_scale)
-                self.policy = Policy(pol_path, pcfg, self.nj, num_neck=len(NECK_JOINTS))
-                print(f"[sim2sim] policy loaded: {pol_path}")
+            pcfg = dict(full["policy"])
+            pcfg["default_dof_pos"] = pcfg["default_dof_pos"][:self.nj]
+            pcfg["policy_dt"] = float(full["control"]["dt"]) * int(full["control"]["decimation"])
+            sim2sim_ctrl = full.get("sim2sim", {})
+            if "action_scale" in sim2sim_ctrl:
+                pcfg["action_scale"] = sim2sim_ctrl["action_scale"]
+            if getattr(args, "sim_action_scale", None) is not None:
+                pcfg["action_scale"] = float(args.sim_action_scale)
+
+            walk_path = args.policy or os.path.join(ROOT, full["policy"]["path"])
+            if os.path.exists(walk_path):
+                self.walk_policy = Policy(walk_path, pcfg, self.nj,
+                                          num_neck=len(NECK_JOINTS), stand=False)
+                print(f"[sim2sim] walk policy loaded: {walk_path}")
             else:
-                print(f"[sim2sim] policy not found at {pol_path}, running script-only mode")
+                print(f"[sim2sim] walk policy not found at {walk_path}, RL_WALK unavailable")
+
+            stand_rel = full["policy"].get("stand_path", "policy/stand/policy.onnx")
+            stand_path = args.stand_policy or os.path.join(ROOT, stand_rel)
+            if os.path.exists(stand_path):
+                self.stand_policy = Policy(stand_path, pcfg, self.nj,
+                                           num_neck=len(NECK_JOINTS), stand=True)
+                print(f"[sim2sim] stand policy loaded: {stand_path}")
+            else:
+                print(f"[sim2sim] stand policy not found at {stand_path}, "
+                      "RL_STAND 将回退到行走模型(零命令)")
+        # self.policy: 当前活动模型引用（默认行走，probe/push 等调试路径沿用）
+        self.policy = self.walk_policy
 
         # ---- 路线 B path frame（论文 V-A）：MuJoCo 真值驱动 ----
         pcfg_full = full["policy"]
@@ -560,6 +608,11 @@ class Sim:
         # ---- 2026-07-08 脖子/头部命令 ----
         self.n_neck = len(NECK_JOINTS)
         self.head_cmd = np.zeros(4, dtype=np.float32)  # (Δh, pitch, yaw, roll)
+        # 站立躯干命令 (h, pitch, yaw, roll)，仅 RL_STAND 生效；默认全 0=标称直立站姿。
+        # 键盘微调见 _cmd_key：t/g=pitch± v/c=yaw± y/b=roll± f/z=高度±（切状态清零）。
+        self.torso_cmd = np.zeros(4, dtype=np.float32)
+        # 站立躯干命令范围（对齐训练侧 torso_command_*_range，超范围会被钳到边界）
+        self.max_torso = np.array([0.05, 0.25, 0.35, 0.18], dtype=np.float32)
         cmd_cfg = full.get("command", {})
         self.max_head = np.array([
             float(cmd_cfg.get("max_head_dh", 0.02)),
@@ -666,8 +719,11 @@ class Sim:
         self.last_kd = self.fixed_kd.copy()
         self.neck_target = self.neck_default.copy()
         self.head_cmd[:] = 0.0
-        if self.policy:
-            self.policy.reset()
+        self.torso_cmd[:] = 0.0
+        for pol in (self.walk_policy, self.stand_policy):
+            if pol is not None:
+                pol.reset()
+        self.policy = self.walk_policy  # 活动模型引用复位到行走（默认）
         print("[sim2sim] reset to SIT")
 
     # ---------- 状态 ----------
@@ -831,7 +887,7 @@ class Sim:
         samples = []
         while self.debug_push_policy_step < self.debug_push_steps:
             tau, neck_tau = self.control_step()
-            in_rl = self.state in ("RL_BALANCE", "RL_WALK")
+            in_rl = self.state in ("RL_STAND", "RL_WALK")
             is_policy_tick = in_rl and self.policy and self.rl_tick != last_policy_tick and ((self.rl_tick - 1) % self.decimation == 0)
             active = in_rl and self.debug_push_start <= self.debug_push_policy_step < self.debug_push_start + self.debug_push_duration
             if is_policy_tick:
@@ -937,22 +993,28 @@ class Sim:
             if self.real_output_enabled:
                 self.real_cmd_q = self.bridge.get_state()[0][:self.nj].copy()
             print(f"[real] motor output {'ENABLED' if self.real_output_enabled else 'DISABLED'}")
-        elif c == "1" and self.state == "SIT":
-            if self.real_sit_active:
-                print("[real] 真机仍在缓慢回蹲姿, 完成后再按 1")
-                return
-            if self.bridge and not self.real_sit_done:
-                print("[real] 先按 0 让真机缓慢回蹲姿; 到位后再按 1")
-                return
-            self.stand_start = self.data.qpos[self.q_adr].copy()
-            self.state, self.state_time = "STAND_UP", 0.0
-            print("[FSM] SIT -> STAND_UP")
-        elif c == "2" and self.state == "RL_BALANCE":
-            self.state = "RL_WALK"
-            print("[FSM] RL_BALANCE -> RL_WALK")
-        elif c == "3" and self.state == "RL_WALK":
-            self.state = "RL_BALANCE"
-            print("[FSM] RL_WALK -> RL_BALANCE")
+        elif c == "1":
+            # SIT: 起立脚本；RL 中: 切到站立模型 (RL_STAND)
+            if self.state == "SIT":
+                if self.real_sit_active:
+                    print("[real] 真机仍在缓慢回蹲姿, 完成后再按 1")
+                    return
+                if self.bridge and not self.real_sit_done:
+                    print("[real] 先按 0 让真机缓慢回蹲姿; 到位后再按 1")
+                    return
+                self.stand_start = self.data.qpos[self.q_adr].copy()
+                self.state, self.state_time = "STAND_UP", 0.0
+                print("[FSM] SIT -> STAND_UP (起立后自动进入 RL_STAND 站立模型)")
+            elif self.state in ("RL_STAND", "RL_WALK"):
+                self._switch_rl_state("RL_STAND")
+        elif c == "2":
+            # 切到行走模型 (RL_WALK)
+            if self.state in ("RL_STAND", "RL_WALK"):
+                self._switch_rl_state("RL_WALK")
+        elif c == "3":
+            # 兼容旧键位: 回站立模型 (= 按 1)
+            if self.state in ("RL_STAND", "RL_WALK"):
+                self._switch_rl_state("RL_STAND")
         elif c == "9":
             self.state = "DAMPING"
             self.disable_real_output("DAMPING")
@@ -994,6 +1056,24 @@ class Sim:
             self.head_cmd[0] = max(self.head_cmd[0] - 0.005, -self.max_head[0])
         elif c == "h":
             self.head_cmd[:] = 0.0
+        # ---- 站立躯干命令（仅 RL_STAND 生效，微调站姿）----
+        # t/g=前后倾pitch± v/c=偏航yaw± y/b=侧倾roll± f/z=高度h±
+        elif c == "t":
+            self.torso_cmd[1] = min(self.torso_cmd[1] + 0.05, self.max_torso[1])
+        elif c == "g":
+            self.torso_cmd[1] = max(self.torso_cmd[1] - 0.05, -self.max_torso[1])
+        elif c == "v":
+            self.torso_cmd[2] = min(self.torso_cmd[2] + 0.05, self.max_torso[2])
+        elif c == "c":
+            self.torso_cmd[2] = max(self.torso_cmd[2] - 0.05, -self.max_torso[2])
+        elif c == "y":
+            self.torso_cmd[3] = min(self.torso_cmd[3] + 0.05, self.max_torso[3])
+        elif c == "b":
+            self.torso_cmd[3] = max(self.torso_cmd[3] - 0.05, -self.max_torso[3])
+        elif c == "f":
+            self.torso_cmd[0] = min(self.torso_cmd[0] + 0.005, self.max_torso[0])
+        elif c == "z":
+            self.torso_cmd[0] = max(self.torso_cmd[0] - 0.005, -self.max_torso[0])
         else:
             return
         if c in "wsadqex":
@@ -1002,6 +1082,34 @@ class Sim:
         if c in "ikjluonmh":
             print(f"head_cmd = Δh={self.head_cmd[0]:+.3f} pitch={self.head_cmd[1]:+.2f} "
                   f"yaw={self.head_cmd[2]:+.2f} roll={self.head_cmd[3]:+.2f}")
+        if c in "tgvcybfz":
+            tag = "" if self.state == "RL_STAND" else "  (仅 RL_STAND 生效, 先按1)"
+            print(f"torso_cmd = h={self.torso_cmd[0]:+.3f} pitch={self.torso_cmd[1]:+.2f} "
+                  f"yaw={self.torso_cmd[2]:+.2f} roll={self.torso_cmd[3]:+.2f}{tag}")
+
+    def _switch_rl_state(self, target):
+        """在 RL_STAND(站立模型) 与 RL_WALK(行走模型) 之间切换。
+
+        两个模型互相独立：切换时把目标模型的动作历史/相位清零(fresh start)，
+        目标关节角先锁到当前腿角避免 PD 跳变，命令清零，rl_tick 归零使下一控制步
+        立即触发一次目标模型推理。path frame 保持连续(仍由 MuJoCo 真值驱动)。
+        """
+        if self.state == target:
+            return
+        self.state = target
+        if target == "RL_WALK":
+            self.policy = self.walk_policy
+            self.cmd[:] = 0.0  # 切入行走时速度命令归零，等待手动加速
+            label = "walk model"
+        else:  # RL_STAND
+            self.policy = self.stand_policy or self.walk_policy
+            self.torso_cmd[:] = 0.0  # 切入站立时躯干命令归零(标称直立)
+            label = "stand model" if self.stand_policy else "stand(回退行走模型)"
+        if self.policy is not None:
+            self.policy.reset()
+        self.rl_target = self.data.qpos[self.q_adr].copy()
+        self.rl_tick = 0
+        print(f"[FSM] -> {target} ({label})")
 
     # ---------- 真机输出 ----------
     def disable_real_output(self, reason=""):
@@ -1068,7 +1176,7 @@ class Sim:
                 print("[real] 真机已到蹲姿附近, 可以按 1 起立")
         else:
             target = self.last_target
-            if self.state in ("SIT", "STAND_UP", "RL_BALANCE", "RL_WALK"):
+            if self.state in ("SIT", "STAND_UP", "RL_STAND", "RL_WALK"):
                 kp, kd = self.real_follow_kp, self.real_follow_kd
             else:
                 kp, kd = self.last_kp, self.last_kd
@@ -1094,7 +1202,7 @@ class Sim:
         q, dq, quat, gyro = self.get_obs_raw()
 
         # 姿态保护
-        if self.state in ("STAND_UP", "RL_BALANCE", "RL_WALK"):
+        if self.state in ("STAND_UP", "RL_STAND", "RL_WALK"):
             if quat_rotate_inverse_gravity(quat)[2] > -0.5:
                 self.state = "DAMPING"
                 print("[FSM] attitude protect -> DAMPING")
@@ -1108,45 +1216,61 @@ class Sim:
             kp, kd = self.fixed_kp, self.fixed_kd
             if r >= 1.0:
                 self._remove_stool()  # 站立后移除坐凳, 防止绊脚
+                # 起立完成 → 站立模型 (RL_STAND)。无站立模型时回退到行走模型。
+                self.policy = self.stand_policy or self.walk_policy
+                self.rl_target = self.stand_pose.copy()
+                self.rl_tick = 0
                 if self.policy:
                     self.policy.reset()
-                    self.rl_target = self.stand_pose.copy()
-                    self.rl_tick = 0
-                    # path frame 初始化到当前躯干出生位姿（论文：起始于躯干状态）
-                    base_xy, head_yaw, _, _ = self.path_frame_truth()
-                    self.path_frame.reset(base_xy, head_yaw)
-                    self.state, self.state_time = "RL_BALANCE", 0.0
-                    print("[FSM] STAND_UP -> RL_BALANCE")
-        elif self.state in ("RL_BALANCE", "RL_WALK"):
-            cmd = self.cmd if self.state == "RL_WALK" else np.zeros(3)
-            fresh_policy = self.rl_tick % self.decimation == 0
-            if fresh_policy:
-                # path frame 每策略步推进一次（用 MuJoCo 真值；真机侧改状态估计器）
-                base_xy, head_yaw, feet_center, lin_vel_b = self.path_frame_truth()
-                moving = (float(np.max(np.abs(cmd[:2]))) > self.move_command_threshold) or (
-                    abs(float(cmd[2])) > self.move_command_threshold
-                )
-                self.path_frame.step(
-                    self.policy.policy_dt, cmd, moving, base_xy, head_yaw, feet_center
-                )
-                pos_pf, yaw_pf = self.path_frame.base_in_path_frame(base_xy, head_yaw)
-                neck_q = self.data.qpos[self.neck_q_adr].copy()
-                neck_dq = self.data.qvel[self.neck_v_adr].copy()
-                self.rl_target, self.neck_target = self.policy.step(
-                    q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b,
-                    neck_q, neck_dq, self.head_cmd,
-                )
-            self.rl_tick += 1
-            target, kp, kd = self.rl_target, self.kp, self.kd
-            if fresh_policy and self.run_logger is not None:
-                tilt = quat_rotate_inverse_gravity(quat)
-                _, vel_b = self.base_linear_velocities()
-                self.run_logger.log(
-                    self.data.time, self.state, cmd,
-                    float(self.data.qpos[2]), tilt, vel_b, gyro, q, dq,
-                    self.policy.last_raw_actions, self.policy.last_actions,
-                    self.rl_target,
-                )
+                # path frame 初始化到当前躯干出生位姿（论文：起始于躯干状态）
+                base_xy, head_yaw, _, _ = self.path_frame_truth()
+                self.path_frame.reset(base_xy, head_yaw)
+                self.state, self.state_time = "RL_STAND", 0.0
+                label = "stand model" if self.stand_policy else "stand(回退行走模型)"
+                print(f"[FSM] STAND_UP -> RL_STAND ({label})")
+        elif self.state in ("RL_STAND", "RL_WALK"):
+            # 按状态选活动模型：RL_WALK→行走模型(cmd 速度)，RL_STAND→站立模型(torso 命令)
+            if self.state == "RL_WALK":
+                self.policy = self.walk_policy
+                cmd = self.cmd
+                torso_cmd = np.zeros(4, dtype=np.float32)
+            else:  # RL_STAND
+                self.policy = self.stand_policy or self.walk_policy
+                cmd = np.zeros(3)
+                torso_cmd = self.torso_cmd
+            if self.policy is None:
+                target, kp, kd = self.rl_target, self.kp, self.kd  # 无策略兜底: 锁站姿
+            else:
+                fresh_policy = self.rl_tick % self.decimation == 0
+                if fresh_policy:
+                    # path frame 每策略步推进一次（用 MuJoCo 真值；真机侧改状态估计器）
+                    base_xy, head_yaw, feet_center, lin_vel_b = self.path_frame_truth()
+                    # 只有行走且命令超阈值才平移 path frame；站立走收敛分支
+                    moving = self.state == "RL_WALK" and (
+                        float(np.max(np.abs(cmd[:2]))) > self.move_command_threshold
+                        or abs(float(cmd[2])) > self.move_command_threshold
+                    )
+                    self.path_frame.step(
+                        self.policy.policy_dt, cmd, moving, base_xy, head_yaw, feet_center
+                    )
+                    pos_pf, yaw_pf = self.path_frame.base_in_path_frame(base_xy, head_yaw)
+                    neck_q = self.data.qpos[self.neck_q_adr].copy()
+                    neck_dq = self.data.qvel[self.neck_v_adr].copy()
+                    self.rl_target, self.neck_target = self.policy.step(
+                        q, dq, gyro, cmd, pos_pf, yaw_pf, lin_vel_b,
+                        neck_q, neck_dq, self.head_cmd, torso_cmd,
+                    )
+                self.rl_tick += 1
+                target, kp, kd = self.rl_target, self.kp, self.kd
+                if fresh_policy and self.run_logger is not None:
+                    tilt = quat_rotate_inverse_gravity(quat)
+                    _, vel_b = self.base_linear_velocities()
+                    self.run_logger.log(
+                        self.data.time, self.state, cmd,
+                        float(self.data.qpos[2]), tilt, vel_b, gyro, q, dq,
+                        self.policy.last_raw_actions, self.policy.last_actions,
+                        self.rl_target,
+                    )
         else:  # DAMPING
             target, kp, kd = q, np.zeros(self.nj), np.full(self.nj, self.damping_kd)
 
@@ -1163,7 +1287,7 @@ class Sim:
         # 其余状态锁默认位。增益对齐训练侧 neck ImplicitActuator（kp50/kd2）。
         neck_q = self.data.qpos[self.neck_q_adr]
         neck_dq = self.data.qvel[self.neck_v_adr]
-        if self.state in ("RL_BALANCE", "RL_WALK"):
+        if self.state in ("RL_STAND", "RL_WALK"):
             neck_ref = self.neck_target
         else:
             neck_ref = self.neck_default
@@ -1352,7 +1476,9 @@ class Sim:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(ROOT, "config/oceanbdx.yaml"))
-    ap.add_argument("--policy", default=None, help="覆盖config中的policy路径")
+    ap.add_argument("--policy", default=None, help="覆盖config中的行走policy路径")
+    ap.add_argument("--stand-policy", default=None,
+                    help="覆盖config中的站立policy路径 (policy.stand_path)")
     ap.add_argument("--no-policy", action="store_true", help="仅验证起立脚本, 不加载策略")
     ap.add_argument("--real", action="store_true",
                     help="连接真机电机: 普通sim2sim中输出仿真目标角; 与 --manual 组合时为滑块联调")
