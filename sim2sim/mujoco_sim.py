@@ -404,7 +404,7 @@ class Policy:
             ]
         else:
             # 行走尾部：phase 二阶谐波4 + cmd3 + head_cmd4（完整观测共 80 维）。
-            # 相位积分：φ̇ 恒定步频；站立不清零（训练 obs 不对站立屏蔽谐波）。
+            # 相位积分：命令超过移动阈值时按速度改变步频；零速时冻结相位。
             # 训练侧 _pre_physics_step 在 _get_observations 之前推进相位，obs 见已推进的 φ。
             speed_fraction = min(
                 1.0,
@@ -415,7 +415,9 @@ class Policy:
                 ),
             )
             period = self.gait_cycle_period + (self.gait_period_fast - self.gait_cycle_period) * speed_fraction
-            self.gait_phase = (self.gait_phase + self.policy_dt / period) % 1.0
+            moving = bool(np.max(np.abs(cmd)) > self.move_command_threshold)
+            if moving:
+                self.gait_phase = (self.gait_phase + self.policy_dt / period) % 1.0
             two_pi_phase = 2.0 * np.pi * self.gait_phase
             phase_feat = np.array([
                 np.sin(two_pi_phase),

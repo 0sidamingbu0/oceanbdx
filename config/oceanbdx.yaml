@@ -114,7 +114,7 @@ oceanbdx:
     reference_vx_max: 0.25
     reference_vy_max: 0.15
     reference_wz_max: 0.8
-    move_command_threshold: 0.08  # 命令幅度低于此值视为站立(path frame 走收敛分支); 相位照常推进不清零
+    move_command_threshold: 0.08  # 命令幅度低于此值视为站立：path frame 收敛，步态相位冻结
     # 策略的 default joint pos (训练时 init_state.joint_pos), 站立姿态为全0
     default_dof_pos: [0, 0, 0, 0, 0,  0, 0, 0, 0, 0]
     # ---- 路线 B 新增（须与 oceanisaaclab_walk_env_cfg.py 一致）----
