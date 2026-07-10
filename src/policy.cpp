@@ -44,6 +44,25 @@ bool PolicyRunner::Load()
         impl_->output_name = impl_->session->GetOutputNameAllocated(0, alloc).get();
         auto shape = impl_->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
         impl_->obs_dim = shape.back();
+        const int64_t legacy_obs_dim = 11 + 3 * cfg_.num_joints;
+        if (cfg_.num_obs > 0 && impl_->obs_dim != cfg_.num_obs)
+        {
+            std::cerr << "[Policy] model obs_dim=" << impl_->obs_dim
+                      << " != config policy.num_obs=" << cfg_.num_obs << std::endl;
+            impl_->session.reset();
+            return false;
+        }
+        if (impl_->obs_dim != legacy_obs_dim)
+        {
+            std::cerr << "[Policy] C++ runner currently constructs only the legacy "
+                      << legacy_obs_dim << "-D observation, but the model requires "
+                      << impl_->obs_dim
+                      << ". Use the Python sim2sim runner until path-frame, base velocity, "
+                         "neck state, and 14-D action support are ported."
+                      << std::endl;
+            impl_->session.reset();
+            return false;
+        }
         std::cout << "[Policy] loaded " << cfg_.policy_path
                   << " obs_dim=" << impl_->obs_dim << std::endl;
         return true;
