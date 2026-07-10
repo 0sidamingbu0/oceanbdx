@@ -144,8 +144,10 @@ oceanbdx:
     neck_kd: 2.0
 
   command:
-    max_vx: 0.5
-    max_vy: 0.3
+    # Must stay inside the walk training distribution. Values above these limits make the
+    # policy extrapolate and were observed to accumulate forward lean before falling.
+    max_vx: 0.25
+    max_vy: 0.15
     max_wz: 0.8
     # 头部命令范围（与训练侧 head_command_*_range 一致；键盘微调步长见 mujoco_sim）
     max_head_dh: 0.02
