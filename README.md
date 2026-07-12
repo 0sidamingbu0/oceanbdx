@@ -75,6 +75,8 @@ python3 sim2sim/mujoco_sim.py --no-policy     # 仅验证起立脚本
 python3 sim2sim/mujoco_sim.py                 # 同时加载行走+站立两个 ONNX 完整验证
 # 站立/行走是两个独立模型: 起立(1)后进站立模型, 按 2 切行走模型, 按 1 切回站立模型
 python3 sim2sim/mujoco_sim.py --stand-policy policy/stand/policy.onnx   # 覆盖站立 onnx 路径
+python3 sim2sim/diag_walk_policy.py --vx 0.15    # 无界面前进逐脚间隙/力矩/脖子诊断
+python3 sim2sim/diag_walk_policy.py --vx -0.15   # 同口径后退诊断
 ```
 
 > **跑 IsaacLab / 需要 torch 的脚本时(如 `sim2sim/scan_ckpt.py`、`export_ckpt_onnx.py`),用 IsaacLab 运行时 python:**

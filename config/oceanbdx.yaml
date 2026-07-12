@@ -150,10 +150,10 @@ oceanbdx:
     max_vy: 0.15
     max_wz: 0.8
     # 头部命令范围（与训练侧 head_command_*_range 一致；键盘微调步长见 mujoco_sim）
-    max_head_dh: 0.02
-    max_head_pitch: 0.5
-    max_head_yaw: 1.0
-    max_head_roll: 0.6
+    max_head_dh: 0.007
+    max_head_pitch: 0.17
+    max_head_yaw: 0.33
+    max_head_roll: 0.20
 
   # ---- MuJoCo sim2sim 专用覆盖 ----
   # Isaac Lab 训练的 walking actuator model 在 MuJoCo 中用显式 torque PD 复刻；

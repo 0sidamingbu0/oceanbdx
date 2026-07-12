@@ -661,10 +661,10 @@ class Sim:
         self.max_torso = np.array([0.05, 0.25, 0.35, 0.18], dtype=np.float32)
         cmd_cfg = full.get("command", {})
         self.max_head = np.array([
-            float(cmd_cfg.get("max_head_dh", 0.02)),
-            float(cmd_cfg.get("max_head_pitch", 0.5)),
-            float(cmd_cfg.get("max_head_yaw", 1.0)),
-            float(cmd_cfg.get("max_head_roll", 0.6)),
+            float(cmd_cfg.get("max_head_dh", 0.007)),
+            float(cmd_cfg.get("max_head_pitch", 0.17)),
+            float(cmd_cfg.get("max_head_yaw", 0.33)),
+            float(cmd_cfg.get("max_head_roll", 0.20)),
         ], dtype=np.float32)
         self.neck_kp = float(pcfg_full.get("neck_kp", 50.0))
         self.neck_kd = float(pcfg_full.get("neck_kd", 2.0))
