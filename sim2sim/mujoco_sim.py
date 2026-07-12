@@ -4,16 +4,16 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 
 复刻真实机器人的状态机最小闭环: SIT -> STAND_UP(脚本插值) -> RL_STAND(站立模型) <-> RL_WALK(行走模型)
 ★ 站立与行走是两个独立训练/导出的 ONNX 模型 (policy/stand/policy.onnx 与 policy/policy.onnx)：
-  - 起立完成后自动进入 RL_STAND, 加载站立模型 (74 维观测, torso 位姿命令, 无相位);
+  - 起立完成后自动进入 RL_STAND, 加载站立模型 (77 维观测, torso 位姿命令, 无相位);
   - 按 2 切到行走模型 (RL_WALK, 80 维观测, 速度命令 + 相位); 按 1 切回站立模型。
-观测/动作处理与 C++ 部署代码 (src/policy.cpp) 完全一致, 用于在上真机前验证:
+观测/动作处理对齐 OceanIsaacLab 训练侧；C++ 真机主控仍待升级到双模型接口。这里用于验证:
   - IsaacLab 导出的两个 policy.onnx 正确性
   - 观测顺序/缩放/默认关节角配置正确性
   - 起立脚本与RL切换的衔接、站立/行走模型互切
 
 用法 (在 oceanbdx 根目录):
     python3 sim2sim/mujoco_sim.py [--policy policy/policy.onnx] [--config config/oceanbdx.yaml]
-    python3 sim2sim/mujoco_sim.py --no-policy     # 无策略, 只验证起立脚本+站立PD保持
+    python3 sim2sim/mujoco_sim.py --no-policy     # 无策略, 只验证起立脚本与RL接管状态机
     python3 sim2sim/mujoco_sim.py --manual        # 纯sim: 拖动滑块摆关节角
     python3 sim2sim/mujoco_sim.py --real --no-policy # 仿真目标角→真机, 面板显示真机误差
     python3 sim2sim/mujoco_sim.py --real --manual # 真机联调: 拖动滑块→PD下发到真机
@@ -33,6 +33,7 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 """
 import argparse
 import os
+import queue
 import sys
 import time
 
@@ -67,6 +68,14 @@ def yaw_from_quat(q):
     return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def rpy_from_quat(q):
+    """Return intrinsic XYZ roll, pitch and yaw for a MuJoCo (w,x,y,z) quaternion."""
+    w, x, y, z = q
+    roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+    return np.array([roll, pitch, yaw_from_quat(q)], dtype=float)
+
+
 def wrap_angle(a):
     """把角度环绕到 (-π, π]。与训练侧 path_frame.wrap_angle 一致。"""
     return np.arctan2(np.sin(a), np.cos(a))
@@ -76,8 +85,8 @@ class PathFrameNP:
     """path frame（BDX 论文 V-A / Fig.4）的单 env numpy 复刻。
 
     逐行为对齐训练侧 oceanisaaclab .../path_frame.py：+x 轴=头部前向，行走按 path 系
-    命令积分、站立一阶低通收敛到双脚中心+躯干朝向、最大偏差投影拉回躯干附近。
-    sim2sim 用 MuJoCo 真值驱动（躯干世界 xy/yaw 里程计 + 双脚 FK 中心）；真机侧改由
+    命令积分、站立一阶低通收敛到双脚中心+双脚平均朝向、最大偏差投影拉回躯干附近。
+    sim2sim 用 MuJoCo 真值驱动（躯干世界 xy/yaw 里程计 + 双脚 FK 中心/朝向）；真机侧改由
     状态估计器提供同样的量（论文 V-D 要求 runtime 与训练逐行为一致）。
     """
 
@@ -92,7 +101,7 @@ class PathFrameNP:
         self.pos = np.asarray(base_pos_xy, dtype=float).copy()
         self.yaw = float(head_yaw)
 
-    def step(self, dt, cmd, moving, base_pos_xy, head_yaw, feet_center_xy):
+    def step(self, dt, cmd, moving, base_pos_xy, head_yaw, feet_center_xy, feet_heading_yaw):
         cos_y, sin_y = np.cos(self.yaw), np.sin(self.yaw)
         if moving:
             # 行走：path 系命令 (vx 头前, vy 头左, wz) 旋到世界系再积分
@@ -101,10 +110,10 @@ class PathFrameNP:
             self.pos = self.pos + np.array([dx_w, dy_w]) * dt
             self.yaw = self.yaw + cmd[2] * dt
         else:
-            # 站立：一阶低通收敛到双脚中心 + 躯干朝向
+            # 站立：一阶低通收敛到双脚平均位置与朝向（论文 Fig. 4）。
             alpha = min(1.0, dt / self.stand_time_constant)
             self.pos = self.pos + alpha * (np.asarray(feet_center_xy, dtype=float) - self.pos)
-            self.yaw = self.yaw + alpha * wrap_angle(head_yaw - self.yaw)
+            self.yaw = self.yaw + alpha * wrap_angle(float(feet_heading_yaw) - self.yaw)
         self.yaw = wrap_angle(self.yaw)
         # 最大偏差投影：把 path frame 拉回躯干附近（位置 + 朝向分别投影）
         offset = self.pos - np.asarray(base_pos_xy, dtype=float)
@@ -296,7 +305,7 @@ class Policy:
         import onnxruntime as ort
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         self.input_name = self.sess.get_inputs()[0].name
-        expected_obs = 74 if stand else 80
+        expected_obs = 77 if stand else 80
         actual_obs = self.sess.get_inputs()[0].shape[-1]
         if actual_obs != expected_obs:
             raise RuntimeError(
@@ -309,7 +318,7 @@ class Policy:
         self.n_neck = num_neck  # 脖子关节数（4）
         self.n_act = num_joints + num_neck  # 动作维度（14）
         # stand=True：独立训练的站立（perpetual）模型。观测去相位谐波、命令由
-        #   (cmd3 行走速度) 换成 (torso4 躯干位姿命令 h,pitch,yaw,roll)，共 74 维；
+        #   (cmd3 行走速度) 换成 (torso4 躯干位姿命令 h,pitch,yaw,roll)，共 77 维；
         #   动作解码与行走完全一致。stand=False：行走模型，80 维（含姿态、phase4 + cmd3）。
         self.stand = bool(stand)
         self.default_dof_pos = np.array(cfg["default_dof_pos"], dtype=np.float32)
@@ -344,17 +353,40 @@ class Policy:
         self.last_projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self.last_raw_actions = np.zeros(self.n_act, dtype=np.float32)
 
-    def reset(self):
-        self.last_actions[:] = 0
-        self.last_last_actions[:] = 0
+    def reset(self, previous_actions=None, previous_previous_actions=None):
+        """Reset recurrent policy-side state while optionally preserving action history.
+
+        The paper relies on both policies receiving the same two physical actions across a
+        transition.  Since stand and walk share the 14-D bounded action mapping, their
+        normalized action histories can be transferred directly.
+        """
+        if previous_actions is None:
+            self.last_actions[:] = 0
+        else:
+            previous_actions = np.asarray(previous_actions, dtype=np.float32)
+            if previous_actions.shape != (self.n_act,):
+                raise ValueError(f"previous_actions must have shape {(self.n_act,)}, got {previous_actions.shape}")
+            self.last_actions[:] = np.clip(previous_actions, -self.cfg["clip_actions"], self.cfg["clip_actions"])
+        if previous_previous_actions is None:
+            self.last_last_actions[:] = self.last_actions
+        else:
+            previous_previous_actions = np.asarray(previous_previous_actions, dtype=np.float32)
+            if previous_previous_actions.shape != (self.n_act,):
+                raise ValueError(
+                    f"previous_previous_actions must have shape {(self.n_act,)}, "
+                    f"got {previous_previous_actions.shape}"
+                )
+            self.last_last_actions[:] = np.clip(
+                previous_previous_actions, -self.cfg["clip_actions"], self.cfg["clip_actions"]
+            )
         self.last_obs = None
         self.last_projected_gravity[:] = [0.0, 0.0, -1.0]
-        self.last_raw_actions[:] = 0
+        self.last_raw_actions[:] = self.last_actions
         self.gait_phase = 0.0
 
     def step(self, q, dq, gyro, projected_gravity, cmd, pos_pf, yaw_pf, lin_vel_b,
              neck_q, neck_dq, head_cmd, torso_cmd=None):
-        """一次策略推理（行走 80 维 / 站立 74 维，由 self.stand 决定观测尾部）。
+        """一次策略推理（行走 80 维 / 站立 77 维，由 self.stand 决定观测尾部）。
 
         Args:
             q, dq: (nj,) 腿关节角/角速度（URDF 系）。
@@ -375,14 +407,13 @@ class Policy:
         head_cmd = np.asarray(head_cmd, dtype=np.float32)
         yaw_feat = np.array([np.sin(yaw_pf), np.cos(yaw_pf)], dtype=np.float32)
 
-        # 站立模型保持原 74 维接口；行走模型在 path yaw 后加入 projected gravity，
-        # 形成 80 维完整 torso orientation 表达。
+        # 两个策略均使用 projected gravity 表达 torso roll/pitch。站立尾部少 phase4/cmd3，
+        # 改为 torso_cmd4，因此为 77 维；行走为 80 维。
         obs_common = [
             np.asarray(pos_pf, dtype=np.float32) * self.pos_pf_scale,
             yaw_feat,
+            np.asarray(projected_gravity, dtype=np.float32),
         ]
-        if not self.stand:
-            obs_common.append(np.asarray(projected_gravity, dtype=np.float32))
         obs_common += [
             np.asarray(lin_vel_b, dtype=np.float32) * self.lin_vel_scale,
             gyro * c["ang_vel_scale"],
@@ -395,7 +426,7 @@ class Policy:
         ]
 
         if self.stand:
-            # 站立尾部：torso_cmd4 + head_cmd4（无相位谐波，共 74 维）。
+            # 站立尾部：torso_cmd4 + head_cmd4（无相位谐波，共 77 维）。
             if torso_cmd is None:
                 torso_cmd = np.zeros(4, dtype=np.float32)
             obs_tail = [
@@ -546,11 +577,10 @@ class Sim:
         self.fixed_kp = np.array(ctrl["fixed_kp"][:self.nj])
         self.fixed_kd = np.array(ctrl["fixed_kd"][:self.nj])
         self.tau_limit = np.array(ctrl["torque_limits"][:self.nj])
-        self.stand_kp = np.array(sim2sim_ctrl.get("stand_rl_kp", [50.0] * self.nj))[:self.nj]
-        self.stand_kd = np.array(sim2sim_ctrl.get("stand_rl_kd", [2.5] * self.nj))[:self.nj]
         self.control_dt = ctrl["dt"]
         self.decimation = ctrl["decimation"]
         self.stand_duration = ctrl["stand_duration"]
+        self.rl_gain_blend_duration = max(0.0, float(ctrl.get("rl_gain_blend_duration", 0.5)))
         self.damping_kd = ctrl["damping_kd"]
 
         self.joint_lower = np.array(ctrl["joint_lower"][:self.nj], dtype=float)
@@ -564,6 +594,21 @@ class Sim:
         self.motor_qd_s = 0.1
         cutoff = float(sim2sim_ctrl.get("action_lowpass_cutoff_hz", 37.5))
         self.target_lowpass_alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff * self.control_dt)
+        self.switch_contact_force_threshold = float(
+            sim2sim_ctrl.get("switch_contact_force_threshold", 10.0)
+        )
+        self.switch_double_support_confirm_steps = max(
+            1, int(sim2sim_ctrl.get("switch_double_support_confirm_steps", 2))
+        )
+        self.switch_double_support_timeout_steps = max(
+            1,
+            int(
+                round(
+                    float(sim2sim_ctrl.get("switch_double_support_timeout_s", 2.0))
+                    / self.control_dt
+                )
+            ),
+        )
         self.policy_target_prev = np.zeros(self.nj)
         self.policy_target_next = np.zeros(self.nj)
         self.filtered_policy_target = np.zeros(self.nj)
@@ -602,7 +647,7 @@ class Sim:
         self.last_kp = self.fixed_kp.copy()
         self.last_kd = self.fixed_kd.copy()
 
-        # 两个独立模型：行走 (RL_WALK, 80 维) 与站立 (RL_STAND, 74 维)。
+        # 两个独立模型：行走 (RL_WALK, 80 维) 与站立 (RL_STAND, 77 维)。
         # self.walk_policy / self.stand_policy 分别加载；self.policy 始终指向"当前
         # 活动模型"(在 control_step 里按状态切换)，供调试/日志/reset 复用。
         self.walk_policy = None
@@ -648,8 +693,34 @@ class Sim:
             max_pos_deviation=float(pcfg_full.get("path_frame_max_pos_deviation", 0.25)),
             max_yaw_deviation=float(pcfg_full.get("path_frame_max_yaw_deviation", 0.6)),
         )
-        # 双脚 geom（站立收敛目标 = 双脚中心 FK 真值）
+        # Contact uses sole geoms, while path-frame kinematics must use the terminal link
+        # origins/quaternions, matching IsaacLab's body_pos_w/body_quat_w exactly.
         self.foot_geom_ids = [self.model.geom("foot_r").id, self.model.geom("foot_l").id]
+        self.foot_body_ids = [int(self.model.geom_bodyid[gid]) for gid in self.foot_geom_ids]
+        self.floor_geom_id = self.model.geom("floor").id
+        # 左右脚链是镜像的，两个 foot frame 的局部 +x 在 neutral pose 中相反。
+        # 从 q=0 模型姿态标定各自到“头部前向”的 yaw offset，运行时再做圆均值。
+        mujoco.mj_forward(self.model, self.data)
+        neutral_head_yaw = yaw_from_quat(self.data.qpos[3:7]) + self.head_yaw_offset
+        neutral_foot_yaws = np.array([
+            np.arctan2(
+                self.data.xmat[bid].reshape(3, 3)[1, 0],
+                self.data.xmat[bid].reshape(3, 3)[0, 0],
+            )
+            for bid in self.foot_body_ids
+        ])
+        self.foot_heading_offsets = np.array(
+            [wrap_angle(neutral_head_yaw - yaw) for yaw in neutral_foot_yaws], dtype=float
+        )
+        neutral_feet_center = np.mean(
+            [self.data.xpos[bid, :2] for bid in self.foot_body_ids], axis=0
+        )
+        neutral_rel = self.data.qpos[:2] - neutral_feet_center
+        cos_y, sin_y = np.cos(neutral_head_yaw), np.sin(neutral_head_yaw)
+        self.neutral_torso_pos_pf = np.array([
+            neutral_rel[0] * cos_y + neutral_rel[1] * sin_y,
+            -neutral_rel[0] * sin_y + neutral_rel[1] * cos_y,
+        ], dtype=np.float32)
 
         # ---- 2026-07-08 脖子/头部命令 ----
         self.n_neck = len(NECK_JOINTS)
@@ -657,9 +728,19 @@ class Sim:
         # 站立躯干命令 (h, pitch, yaw, roll)，仅 RL_STAND 生效；默认全 0=标称直立站姿。
         # 键盘微调见 _cmd_key：t/g=pitch± v/c=yaw± y/b=roll± f/z=高度±（切状态清零）。
         self.torso_cmd = np.zeros(4, dtype=np.float32)
-        # 站立躯干命令范围（对齐训练侧 torso_command_*_range，超范围会被钳到边界）
-        self.max_torso = np.array([0.05, 0.25, 0.35, 0.18], dtype=np.float32)
         cmd_cfg = full.get("command", {})
+        # 站立高度命令是不对称范围，必须显式保存 min/max。
+        self.torso_command_min = np.array(
+            cmd_cfg.get("torso_command_min", [-0.04, -0.17, -0.24, -0.09]), dtype=np.float32
+        )
+        self.torso_command_max = np.array(
+            cmd_cfg.get("torso_command_max", [0.01, 0.17, 0.24, 0.09]), dtype=np.float32
+        )
+        if self.torso_command_min.shape != (4,) or self.torso_command_max.shape != (4,):
+            raise ValueError("command.torso_command_min/max must each contain four values")
+        if np.any(self.torso_command_min >= self.torso_command_max):
+            raise ValueError("command.torso_command_min must be smaller than torso_command_max")
+        self.stand_base_height = float(pcfg_full.get("stand_base_height", 0.38498640060424805))
         self.max_head = np.array([
             float(cmd_cfg.get("max_head_dh", 0.007)),
             float(cmd_cfg.get("max_head_pitch", 0.17)),
@@ -672,9 +753,24 @@ class Sim:
         self.neck_default = np.array(neck_default, dtype=np.float32)
         # 脖子位置目标（策略输出，RL 前锁默认位）
         self.neck_target = self.neck_default.copy()
+        self.neck_policy_target_prev = self.neck_default.copy()
+        self.neck_policy_target_next = self.neck_default.copy()
+        self.filtered_neck_target = self.neck_default.copy()
 
         self.state = "SIT"
         self.state_time = 0.0
+        self._rl_switch_requests = queue.SimpleQueue()
+        self.pending_rl_state = None
+        self._double_support_confirm_count = 0
+        self._switch_seen_single_support = False
+        self._switch_wait_steps = 0
+        self._rl_gain_blend_active = False
+        self._rl_gain_blend_elapsed = 0.0
+        self._rl_gain_blend_ratio = 1.0
+        self._rl_gain_blend_start_target = self.stand_pose.copy()
+        self._rl_gain_blend_start_neck_target = self.neck_default.copy()
+        self._rl_gain_blend_start_torso_command = np.zeros(4, dtype=np.float32)
+        self._rl_gain_blend_target_torso_command = np.zeros(4, dtype=np.float32)
         self.cmd = np.zeros(3)
         self.run_logger = None
         self.want_runlog = not bool(getattr(args, "no_log", False))
@@ -720,8 +816,8 @@ class Sim:
         dq = np.zeros(self.nj, dtype=np.float32)
         gyro = np.zeros(3, dtype=np.float32)
         cmd = np.zeros(3, dtype=np.float32)
-        # 理想直立零命令：path 系躯干位于原点、朝向对齐、线速度 0
-        pos_pf = np.zeros(2, dtype=np.float32)
+        # 理想直立零命令：path frame 已收敛到双脚中心，保留真实 torso-foot 偏置。
+        pos_pf = self.neutral_torso_pos_pf.copy()
         yaw_pf = 0.0
         lin_vel_b = np.zeros(3, dtype=np.float32)
         neck_q = np.zeros(self.n_neck, dtype=np.float32)
@@ -763,12 +859,32 @@ class Sim:
         mujoco.mj_forward(self.model, self.data)
         self.state = "SIT"
         self.state_time = 0.0
+        self._rl_switch_requests = queue.SimpleQueue()
+        self.pending_rl_state = None
+        self._double_support_confirm_count = 0
+        self._switch_seen_single_support = False
+        self._switch_wait_steps = 0
+        self._rl_gain_blend_active = False
+        self._rl_gain_blend_elapsed = 0.0
+        self._rl_gain_blend_ratio = 1.0
+        self._rl_gain_blend_start_target = self.stand_pose.copy()
+        self._rl_gain_blend_start_neck_target = self.neck_default.copy()
+        self._rl_gain_blend_start_torso_command[:] = 0.0
+        self._rl_gain_blend_target_torso_command[:] = 0.0
         self.cmd[:] = 0
         self.rl_target = self.stand_pose.copy()
+        self.policy_target_prev = self.stand_pose.copy()
+        self.policy_target_next = self.stand_pose.copy()
+        self.filtered_policy_target = self.stand_pose.copy()
+        self.policy_substep = self.decimation
+        self.rl_tick = 0
         self.last_target = self.sit_pose.copy()
         self.last_kp = self.fixed_kp.copy()
         self.last_kd = self.fixed_kd.copy()
         self.neck_target = self.neck_default.copy()
+        self.neck_policy_target_prev = self.neck_default.copy()
+        self.neck_policy_target_next = self.neck_default.copy()
+        self.filtered_neck_target = self.neck_default.copy()
         self.head_cmd[:] = 0.0
         self.torso_cmd[:] = 0.0
         for pol in (self.walk_policy, self.stand_policy):
@@ -858,30 +974,50 @@ class Sim:
         return lin_vel_w, lin_vel_b
 
     def path_frame_truth(self):
-        """从 MuJoCo 读 path frame 所需真值：躯干 xy、头部 yaw、双脚中心 xy、body 线速度。
+        """从 MuJoCo 读 path frame 所需真值：躯干、双脚中心/朝向与 body 线速度。
 
         真机侧这些量改由状态估计器/里程计 + FK 提供（论文 V-D 要求 runtime 一致）。
         """
         base_xy = self.data.qpos[0:2].copy()
         head_yaw = yaw_from_quat(self.data.qpos[3:7]) + self.head_yaw_offset
-        feet_center = np.mean(
-            [self.data.geom_xpos[gid, :2] for gid in self.foot_geom_ids], axis=0
-        )
+        feet_center = np.mean([self.data.xpos[bid, :2] for bid in self.foot_body_ids], axis=0)
+        foot_yaws = np.array([
+            np.arctan2(
+                self.data.xmat[bid].reshape(3, 3)[1, 0],
+                self.data.xmat[bid].reshape(3, 3)[0, 0],
+            )
+            for bid in self.foot_body_ids
+        ])
+        calibrated_yaws = foot_yaws + self.foot_heading_offsets
+        feet_heading = np.arctan2(np.mean(np.sin(calibrated_yaws)), np.mean(np.cos(calibrated_yaws)))
         _, lin_vel_b = self.base_linear_velocities()
-        return base_xy, head_yaw, feet_center, lin_vel_b
+        return base_xy, head_yaw, feet_center, feet_heading, lin_vel_b
+
+    def _set_stand_command_from_current_pose(self):
+        """Initialize g_perp from the hand-off pose instead of commanding an abrupt zero."""
+        quat = self.data.qpos[3:7]
+        roll, pitch, _ = rpy_from_quat(quat)
+        head_yaw = yaw_from_quat(quat) + self.head_yaw_offset
+        _, yaw_pf = self.path_frame.base_in_path_frame(self.data.qpos[:2], head_yaw)
+        command = np.array(
+            [self.data.qpos[2] - self.stand_base_height, pitch, yaw_pf, roll],
+            dtype=np.float32,
+        )
+        self.torso_cmd[:] = np.clip(
+            command, self.torso_command_min, self.torso_command_max
+        )
 
     def foot_contact_forces(self):
         left_force = 0.0
         right_force = 0.0
-        try:
-            left_gid = self.model.geom("foot_l").id
-            right_gid = self.model.geom("foot_r").id
-        except KeyError:
-            return left_force, right_force
+        right_gid, left_gid = self.foot_geom_ids
         force = np.zeros(6)
         for contact_index in range(self.data.ncon):
             contact = self.data.contact[contact_index]
-            if contact.geom1 not in (left_gid, right_gid) and contact.geom2 not in (left_gid, right_gid):
+            pair = (contact.geom1, contact.geom2)
+            if self.floor_geom_id not in pair:
+                continue
+            if left_gid not in pair and right_gid not in pair:
                 continue
             mujoco.mj_contactForce(self.model, self.data, contact_index, force)
             normal_force = max(0.0, float(force[0]))
@@ -1069,6 +1205,14 @@ class Sim:
                 self._switch_rl_state("RL_STAND")
         elif c == "9":
             self.state = "DAMPING"
+            self._rl_switch_requests = queue.SimpleQueue()
+            self.pending_rl_state = None
+            self._double_support_confirm_count = 0
+            self._switch_seen_single_support = False
+            self._switch_wait_steps = 0
+            self._rl_gain_blend_active = False
+            self._rl_gain_blend_elapsed = 0.0
+            self._rl_gain_blend_ratio = 1.0
             self.disable_real_output("DAMPING")
             print("[FSM] -> DAMPING")
         elif c == "r":
@@ -1111,21 +1255,21 @@ class Sim:
         # ---- 站立躯干命令（仅 RL_STAND 生效，微调站姿）----
         # t/g=前后倾pitch± v/c=偏航yaw± y/b=侧倾roll± f/z=高度h±
         elif c == "t":
-            self.torso_cmd[1] = min(self.torso_cmd[1] + 0.05, self.max_torso[1])
+            self.torso_cmd[1] = min(self.torso_cmd[1] + 0.05, self.torso_command_max[1])
         elif c == "g":
-            self.torso_cmd[1] = max(self.torso_cmd[1] - 0.05, -self.max_torso[1])
+            self.torso_cmd[1] = max(self.torso_cmd[1] - 0.05, self.torso_command_min[1])
         elif c == "v":
-            self.torso_cmd[2] = min(self.torso_cmd[2] + 0.05, self.max_torso[2])
+            self.torso_cmd[2] = min(self.torso_cmd[2] + 0.05, self.torso_command_max[2])
         elif c == "c":
-            self.torso_cmd[2] = max(self.torso_cmd[2] - 0.05, -self.max_torso[2])
+            self.torso_cmd[2] = max(self.torso_cmd[2] - 0.05, self.torso_command_min[2])
         elif c == "y":
-            self.torso_cmd[3] = min(self.torso_cmd[3] + 0.05, self.max_torso[3])
+            self.torso_cmd[3] = min(self.torso_cmd[3] + 0.05, self.torso_command_max[3])
         elif c == "b":
-            self.torso_cmd[3] = max(self.torso_cmd[3] - 0.05, -self.max_torso[3])
+            self.torso_cmd[3] = max(self.torso_cmd[3] - 0.05, self.torso_command_min[3])
         elif c == "f":
-            self.torso_cmd[0] = min(self.torso_cmd[0] + 0.005, self.max_torso[0])
+            self.torso_cmd[0] = min(self.torso_cmd[0] + 0.005, self.torso_command_max[0])
         elif c == "z":
-            self.torso_cmd[0] = max(self.torso_cmd[0] - 0.005, -self.max_torso[0])
+            self.torso_cmd[0] = max(self.torso_cmd[0] - 0.005, self.torso_command_min[0])
         else:
             return
         moving_now = bool(np.max(np.abs(self.cmd)) > self.move_command_threshold)
@@ -1149,32 +1293,132 @@ class Sim:
                   f"yaw={self.torso_cmd[2]:+.2f} roll={self.torso_cmd[3]:+.2f}{tag}")
 
     def _switch_rl_state(self, target):
-        """在 RL_STAND(站立模型) 与 RL_WALK(行走模型) 之间切换。
+        """Queue a policy switch for the next 200 Hz control-loop boundary.
 
-        两个模型互相独立：切换时把目标模型的动作历史/相位清零(fresh start)，
-        目标关节角先锁到当前腿角避免 PD 跳变，命令清零，rl_tick 归零使下一控制步
-        立即触发一次目标模型推理。path frame 保持连续(仍由 MuJoCo 真值驱动)。
+        Keyboard input may arrive on a background thread. It must not mutate policy history or
+        FOH/LPF buffers while inference is running. The main loop consumes this scalar request;
+        walk -> stand then additionally waits for the next confirmed double support.
         """
-        if self.state == target:
-            return
-        self.state = target
+        self._rl_switch_requests.put(target)
+        print(f"[FSM] switch request queued: {self.state} -> {target}")
+
+    def _complete_rl_switch(self, target):
+        """Complete a policy switch while preserving action and setpoint continuity."""
+        source_policy = self.policy
         if target == "RL_WALK":
-            self.policy = self.walk_policy
+            target_policy = self.walk_policy
             self.cmd[:] = 0.0  # 切入行走时速度命令归零，等待手动加速
             label = "walk model"
         else:  # RL_STAND
-            self.policy = self.stand_policy or self.walk_policy
-            self.torso_cmd[:] = 0.0  # 切入站立时躯干命令归零(标称直立)
+            target_policy = self.stand_policy or self.walk_policy
+            # Start the standing reference at the measured hand-off pose. The policy can then
+            # settle naturally under its action-smoothness terms without a command discontinuity.
+            self._set_stand_command_from_current_pose()
             label = "stand model" if self.stand_policy else "stand(回退行走模型)"
-        if self.policy is not None:
-            self.policy.reset()
-        self.rl_target = self.data.qpos[self.q_adr].copy()
-        self.policy_target_prev = self.rl_target.copy()
-        self.policy_target_next = self.rl_target.copy()
-        self.filtered_policy_target = self.rl_target.copy()
+
+        if source_policy is not None:
+            previous_actions = source_policy.last_actions.copy()
+            previous_previous_actions = source_policy.last_last_actions.copy()
+        else:
+            previous_actions = None
+            previous_previous_actions = None
+        if target_policy is not None:
+            target_policy.reset(previous_actions, previous_previous_actions)
+
+        # Keep the target actually applied by the outgoing policy. Starting from measured q
+        # would introduce a setpoint and torque discontinuity even though q itself is smooth.
+        current_leg_target = self.rl_target.copy()
+        current_neck_target = self.neck_target.copy()
+        self.policy_target_prev = current_leg_target.copy()
+        self.policy_target_next = current_leg_target.copy()
+        self.filtered_policy_target = current_leg_target.copy()
+        self.neck_policy_target_prev = current_neck_target.copy()
+        self.neck_policy_target_next = current_neck_target.copy()
+        self.filtered_neck_target = current_neck_target.copy()
         self.policy_substep = self.decimation
         self.rl_tick = 0
+        self.policy = target_policy
+        self.state = target
+        self.pending_rl_state = None
+        self._double_support_confirm_count = 0
+        self._switch_seen_single_support = False
+        self._switch_wait_steps = 0
         print(f"[FSM] -> {target} ({label})")
+
+    def _update_pending_rl_switch(self):
+        """Consume thread-safe requests and finish transitions at a control boundary."""
+        requested = None
+        while True:
+            try:
+                requested = self._rl_switch_requests.get_nowait()
+            except queue.Empty:
+                break
+        if requested is not None:
+            if self.state not in ("RL_STAND", "RL_WALK"):
+                self.pending_rl_state = None
+                self._double_support_confirm_count = 0
+                self._switch_seen_single_support = False
+                self._switch_wait_steps = 0
+                return
+            if requested == self.state:
+                if self.pending_rl_state is not None:
+                    print(f"[FSM] pending switch cancelled; remain in {self.state}")
+                self.pending_rl_state = None
+                self._double_support_confirm_count = 0
+                self._switch_seen_single_support = False
+                self._switch_wait_steps = 0
+            else:
+                self.pending_rl_state = requested
+                self._double_support_confirm_count = 0
+                self._switch_wait_steps = 0
+                if self.state == "RL_WALK" and requested == "RL_STAND":
+                    left_force, right_force = self.foot_contact_forces()
+                    in_double_support = (
+                        left_force >= self.switch_contact_force_threshold
+                        and right_force >= self.switch_contact_force_threshold
+                    )
+                    moving = bool(np.max(np.abs(self.cmd)) > self.move_command_threshold)
+                    # When already walking through double support, wait for single support
+                    # and the following contact edge. At zero command, the current stable
+                    # double support is already a valid hand-off state.
+                    self._switch_seen_single_support = not in_double_support or not moving
+                    suffix = "next " if in_double_support and moving else ""
+                    print(f"[FSM] RL_WALK -> RL_STAND waiting for {suffix}double support")
+
+        if self.pending_rl_state is not None and not (
+            self.state == "RL_WALK" and self.pending_rl_state == "RL_STAND"
+        ):
+            self._complete_rl_switch(self.pending_rl_state)
+            return
+        if self.pending_rl_state != "RL_STAND" or self.state != "RL_WALK":
+            return
+        self._switch_wait_steps += 1
+        if self._switch_wait_steps >= self.switch_double_support_timeout_steps:
+            print("[FSM] RL_WALK -> RL_STAND cancelled: double-support timeout")
+            self.pending_rl_state = None
+            self._double_support_confirm_count = 0
+            self._switch_seen_single_support = False
+            self._switch_wait_steps = 0
+            return
+        left_force, right_force = self.foot_contact_forces()
+        threshold = self.switch_contact_force_threshold
+        in_double_support = left_force >= threshold and right_force >= threshold
+        if not self._switch_seen_single_support:
+            if not in_double_support:
+                self._switch_seen_single_support = True
+            elif not bool(np.max(np.abs(self.cmd)) > self.move_command_threshold):
+                # A stop command can freeze the phase while both feet remain planted.
+                # That stable zero-speed support is a valid hand-off and must not deadlock.
+                self._switch_seen_single_support = True
+            else:
+                self._double_support_confirm_count = 0
+                return
+        if in_double_support:
+            self._double_support_confirm_count += 1
+        else:
+            self._double_support_confirm_count = 0
+        if self._double_support_confirm_count >= self.switch_double_support_confirm_steps:
+            self._complete_rl_switch("RL_STAND")
 
     # ---------- 真机输出 ----------
     def disable_real_output(self, reason=""):
@@ -1270,7 +1514,17 @@ class Sim:
         if self.state in ("STAND_UP", "RL_STAND", "RL_WALK"):
             if quat_rotate_inverse_gravity(quat)[2] > -0.5:
                 self.state = "DAMPING"
+                self._rl_switch_requests = queue.SimpleQueue()
+                self.pending_rl_state = None
+                self._double_support_confirm_count = 0
+                self._switch_seen_single_support = False
+                self._switch_wait_steps = 0
+                self._rl_gain_blend_active = False
+                self._rl_gain_blend_elapsed = 0.0
+                self._rl_gain_blend_ratio = 1.0
                 print("[FSM] attitude protect -> DAMPING")
+
+        self._update_pending_rl_switch()
 
         if self.state == "SIT":
             target, kp, kd = self.sit_pose, self.fixed_kp, self.fixed_kd
@@ -1287,17 +1541,38 @@ class Sim:
                 self.policy_target_prev = self.stand_pose.copy()
                 self.policy_target_next = self.stand_pose.copy()
                 self.filtered_policy_target = self.stand_pose.copy()
+                self.neck_target = self.neck_default.copy()
+                self.neck_policy_target_prev = self.neck_default.copy()
+                self.neck_policy_target_next = self.neck_default.copy()
+                self.filtered_neck_target = self.neck_default.copy()
                 self.policy_substep = self.decimation
                 self.rl_tick = 0
                 if self.policy:
                     self.policy.reset()
-                # path frame 初始化到当前躯干出生位姿（论文：起始于躯干状态）
-                base_xy, head_yaw, _, _ = self.path_frame_truth()
-                self.path_frame.reset(base_xy, head_yaw)
+                # Start in the converged standing frame used by training: feet center/heading.
+                _, _, feet_center, feet_heading, _ = self.path_frame_truth()
+                self.path_frame.reset(feet_center, feet_heading)
+                target_torso_command = self.torso_cmd.copy()
+                self._set_stand_command_from_current_pose()
+                self._rl_gain_blend_start_torso_command = self.torso_cmd.copy()
+                self._rl_gain_blend_target_torso_command = target_torso_command
                 self.state, self.state_time = "RL_STAND", 0.0
+                self._rl_gain_blend_active = self.rl_gain_blend_duration > 0.0
+                self._rl_gain_blend_elapsed = 0.0
+                self._rl_gain_blend_ratio = 0.0 if self._rl_gain_blend_active else 1.0
+                self._rl_gain_blend_start_target = self.stand_pose.copy()
+                self._rl_gain_blend_start_neck_target = self.neck_default.copy()
+                if not self._rl_gain_blend_active:
+                    self.torso_cmd[:] = self._rl_gain_blend_target_torso_command
                 label = "stand model" if self.stand_policy else "stand(回退行走模型)"
                 print(f"[FSM] STAND_UP -> RL_STAND ({label})")
         elif self.state in ("RL_STAND", "RL_WALK"):
+            if self.state == "RL_STAND" and self._rl_gain_blend_active:
+                blend = self._rl_gain_blend_ratio
+                self.torso_cmd[:] = (
+                    self._rl_gain_blend_start_torso_command * (1.0 - blend)
+                    + self._rl_gain_blend_target_torso_command * blend
+                )
             # 按状态选活动模型：RL_WALK→行走模型(cmd 速度)，RL_STAND→站立模型(torso 命令)
             if self.state == "RL_WALK":
                 self.policy = self.walk_policy
@@ -1313,28 +1588,36 @@ class Sim:
                 fresh_policy = self.rl_tick % self.decimation == 0
                 if fresh_policy:
                     # path frame 每策略步推进一次（用 MuJoCo 真值；真机侧改状态估计器）
-                    base_xy, head_yaw, feet_center, lin_vel_b = self.path_frame_truth()
+                    base_xy, head_yaw, feet_center, feet_heading, lin_vel_b = self.path_frame_truth()
                     # 只有行走且命令超阈值才平移 path frame；站立走收敛分支
                     moving = self.state == "RL_WALK" and (
                         float(np.max(np.abs(cmd[:2]))) > self.move_command_threshold
                         or abs(float(cmd[2])) > self.move_command_threshold
                     )
                     self.path_frame.step(
-                        self.policy.policy_dt, cmd, moving, base_xy, head_yaw, feet_center
+                        self.policy.policy_dt,
+                        cmd,
+                        moving,
+                        base_xy,
+                        head_yaw,
+                        feet_center,
+                        feet_heading,
                     )
                     pos_pf, yaw_pf = self.path_frame.base_in_path_frame(base_xy, head_yaw)
                     neck_q = self.data.qpos[self.neck_q_adr].copy()
                     neck_dq = self.data.qvel[self.neck_v_adr].copy()
-                    next_target, self.neck_target = self.policy.step(
+                    next_target, next_neck_target = self.policy.step(
                         q, dq, gyro, quat_rotate_inverse_gravity(quat), cmd, pos_pf, yaw_pf, lin_vel_b,
                         neck_q, neck_dq, self.head_cmd, torso_cmd,
                     )
                     max_setpoint_deviation = self.motor_tau_max / np.maximum(self.kp, 1.0e-6)
                     next_target = np.clip(next_target, q - max_setpoint_deviation, q + max_setpoint_deviation)
                     next_target = np.clip(next_target, self.joint_lower, self.joint_upper)
-                    self.neck_target = np.clip(self.neck_target, self.neck_lower, self.neck_upper)
+                    next_neck_target = np.clip(next_neck_target, self.neck_lower, self.neck_upper)
                     self.policy_target_prev = self.policy_target_next.copy()
                     self.policy_target_next = next_target
+                    self.neck_policy_target_prev = self.neck_policy_target_next.copy()
+                    self.neck_policy_target_next = next_neck_target
                     self.policy_substep = 0
                 self.policy_substep = min(self.decimation, self.policy_substep + 1)
                 fraction = self.policy_substep / self.decimation
@@ -1344,12 +1627,16 @@ class Sim:
                 self.filtered_policy_target += self.target_lowpass_alpha * (
                     interpolated_target - self.filtered_policy_target
                 )
+                interpolated_neck_target = self.neck_policy_target_prev + fraction * (
+                    self.neck_policy_target_next - self.neck_policy_target_prev
+                )
+                self.filtered_neck_target += self.target_lowpass_alpha * (
+                    interpolated_neck_target - self.filtered_neck_target
+                )
                 self.rl_target = self.filtered_policy_target.copy()
+                self.neck_target = self.filtered_neck_target.copy()
                 self.rl_tick += 1
-                if self.state == "RL_WALK":
-                    target, kp, kd = self.rl_target, self.kp, self.kd
-                else:
-                    target, kp, kd = self.rl_target, self.stand_kp, self.stand_kd
+                target, kp, kd = self.rl_target, self.kp, self.kd
                 if fresh_policy and self.run_logger is not None:
                     tilt = quat_rotate_inverse_gravity(quat)
                     _, vel_b = self.base_linear_velocities()
@@ -1359,6 +1646,21 @@ class Sim:
                         self.policy.last_raw_actions, self.policy.last_actions,
                         self.rl_target,
                     )
+            if self._rl_gain_blend_active:
+                self._rl_gain_blend_elapsed += self.control_dt
+                progress = min(
+                    1.0, self._rl_gain_blend_elapsed / self.rl_gain_blend_duration
+                )
+                blend = 0.5 * (1.0 - np.cos(np.pi * progress))
+                self._rl_gain_blend_ratio = blend
+                target = self._rl_gain_blend_start_target * (1.0 - blend) + target * blend
+                kp = self.fixed_kp * (1.0 - blend) + self.kp * blend
+                kd = self.fixed_kd * (1.0 - blend) + self.kd * blend
+                if progress >= 1.0:
+                    self._rl_gain_blend_active = False
+                    self._rl_gain_blend_ratio = 1.0
+                    if self.state == "RL_STAND":
+                        self.torso_cmd[:] = self._rl_gain_blend_target_torso_command
         else:  # DAMPING
             target, kp, kd = q, np.zeros(self.nj), np.full(self.nj, self.damping_kd)
 
@@ -1369,7 +1671,7 @@ class Sim:
         self.last_kd = kd.copy()
 
         tau_m = kp * (target - q) - kd * dq
-        if self.state == "RL_WALK":
+        if self.state in ("RL_STAND", "RL_WALK"):
             ramp_hi = self.motor_tau_max * (
                 self.motor_qd_max - dq
             ) / (self.motor_qd_max - self.motor_qd_tau_max)
@@ -1397,6 +1699,12 @@ class Sim:
         neck_dq = self.data.qvel[self.neck_v_adr]
         if self.state in ("RL_STAND", "RL_WALK"):
             neck_ref = self.neck_target
+            blend = self._rl_gain_blend_ratio
+            if blend < 1.0:
+                neck_ref = (
+                    self._rl_gain_blend_start_neck_target * (1.0 - blend)
+                    + neck_ref * blend
+                )
         else:
             neck_ref = self.neck_default
         neck_ref = np.clip(neck_ref, self.neck_lower, self.neck_upper)

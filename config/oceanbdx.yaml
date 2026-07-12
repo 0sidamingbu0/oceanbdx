@@ -78,17 +78,18 @@ oceanbdx:
                   0.416, 0.730, 1.341, 0.783, 1.376]
     sit_align_duration: 6.0    # 按0后缓慢回蹲姿脚本时长 (s)
     stand_duration: 3.0        # 起立脚本时长 (s)
+    rl_gain_blend_duration: 0.5  # 起立脚本→RL的躯干命令+目标角+PD增益余弦接管时长
     rl_warmup_duration: 0.0    # 0=与sim2sim一致, 切入RL后不额外缩放policy动作
     rl_target_rate_limit: 0.0  # 0=与sim2sim一致, 不额外限制RL目标角变化率
     damping_kd: 3.0            # 阻尼保护 kd
 
   policy:
     path: policy/policy.onnx   # 行走模型 (RL_WALK): 新版 80 维 ONNX
-    # ★ 2026-07-08: 站立模型 (RL_STAND) 是独立训练/导出的 ONNX (74 维观测)。
+    # ★ 2026-07-12: 站立模型 (RL_STAND) 是独立训练/导出的 ONNX (77 维观测)。
     #   起立完成后自动进入 RL_STAND 加载此模型; 键盘 1=切站立模型, 2=切行走模型。
-    #   74 维 = pos_pf2 + yaw_pf2 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4
+    #   77 维 = pos_pf2 + yaw_pf2 + projected_gravity3 + lin_vel3 + ang_vel3 + q_leg10 + q_neck4
     #          + dq_leg10 + dq_neck4 + a_{t-1}14 + a_{t-2}14 + torso_cmd4 + head_cmd4
-    #   站立模型保持独立的 74 维旧接口；行走模型新增 projected gravity 后为 80 维。
+    #   站立和行走模型均观测 projected gravity；两者仍是独立策略。
     #   对应训练侧 Ocean-BDX-StandPaper-Direct-v0 (oceanisaaclab_stand_env)。
     stand_path: policy/stand/policy.onnx   # 站立模型 ONNX
     # ★ 2026-07-06: 路线 B（BDX 论文适配复刻）观测重构为 57 维，旧 41 维布局作废。
@@ -139,6 +140,7 @@ oceanbdx:
     # 躯干命令 4-DOF (h 躯干高度, pitch 前后倾, yaw 原地偏航, roll 侧倾)；
     # obs 尾部 torso_cmd×torso_command_scale (h 量级小→放大到与角度可比)。
     torso_command_scale: [10.0, 1.0, 1.0, 1.0]
+    stand_base_height: 0.38498640060424805
     # 脖子位置伺服增益（对齐训练侧 neck ImplicitActuator stiffness50/damping2）
     neck_kp: 50.0
     neck_kd: 2.0
@@ -154,18 +156,24 @@ oceanbdx:
     max_head_pitch: 0.17
     max_head_yaw: 0.33
     max_head_roll: 0.20
+    # 站立参考完整 5^4 网格的可行命令域；最大 IK 脚位置残差 2.899mm。
+    # 高度上下限不对称，不能用单个绝对 max 表示。
+    torso_command_min: [-0.04, -0.17, -0.24, -0.09]
+    torso_command_max: [0.01, 0.17, 0.24, 0.09]
 
   # ---- MuJoCo sim2sim 专用覆盖 ----
   # Isaac Lab 训练的 walking actuator model 在 MuJoCo 中用显式 torque PD 复刻；
-  # perpetual stand 保留独立的旧增益，避免两个策略共享错误的低层参数。
+  # 两个RL策略必须使用同一套训练侧附录B执行器，策略切换时低层动力学才连续。
   sim2sim:
     action_scale: 0.5
     rl_kp: [10, 10, 10, 10, 10,  10, 10, 10, 10, 10]
     rl_kd: [0.3, 0.3, 0.3, 0.3, 0.3,  0.3, 0.3, 0.3, 0.3, 0.3]
     action_lowpass_cutoff_hz: 37.5
     neck_torque_limits: [5.0, 5.0, 5.0, 5.0]
-    stand_rl_kp: [50, 50, 50, 50, 50,  50, 50, 50, 50, 50]
-    stand_rl_kd: [2.5, 2.5, 2.5, 2.5, 2.5,  2.5, 2.5, 2.5, 2.5, 2.5]
+    # walk -> stand 等待双脚接触连续确认后再切换（论文 Fig.9）。
+    switch_contact_force_threshold: 10.0
+    switch_double_support_confirm_steps: 2
+    switch_double_support_timeout_s: 2.0
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机
