@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Regression tests for real-signal-compatible stand/walk transitions."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import sys
+import unittest
+from types import SimpleNamespace
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mujoco_sim as ms  # noqa: E402
+
+
+class WalkStandSwitchTest(unittest.TestCase):
+    def setUp(self):
+        args = SimpleNamespace(
+            config=os.path.join(ms.ROOT, "config/oceanbdx.yaml"),
+            policy=None,
+            stand_policy=None,
+            no_policy=False,
+            real=False,
+            manual=False,
+            no_log=True,
+            sim_rl_kd=None,
+            sim_rl_kd_list=None,
+            sim_action_scale=None,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim = ms.Sim(args)
+        self.sim.state = "RL_WALK"
+        self.sim.policy = self.sim.walk_policy
+        self.sim.cmd[:] = [0.20, 0.0, 0.0]
+        self.sim._effective_walk_cmd[:] = self.sim.cmd
+        self.sim.rl_target = self.sim.stand_pose.copy()
+        self.sim.rl_tick = 0
+        self.q = self.sim.stand_pose.copy()
+        self.dq = np.zeros(self.sim.nj)
+        self.quat = np.array([1.0, 0.0, 0.0, 0.0])
+        self.gyro = np.zeros(3)
+
+    def update(self, count=1):
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(count):
+                self.sim._update_pending_rl_switch(
+                    self.q, self.dq, self.quat, self.gyro
+                )
+
+    def request(self, target):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._switch_rl_state(target)
+
+    def set_stand(self, torso_command=None):
+        self.sim._clear_walk_stop_transition()
+        self.sim._clear_stand_to_walk_transition()
+        self.sim.state = "RL_STAND"
+        self.sim.policy = self.sim.stand_policy
+        command = np.zeros(4, dtype=np.float32)
+        if torso_command is not None:
+            command[:] = torso_command
+        self.sim.torso_cmd[:] = command
+        self.sim._effective_torso_cmd[:] = command
+        self.sim.cmd[:] = 0.0
+        self.sim._effective_walk_cmd[:] = 0.0
+        self.sim.rl_target = self.sim.stand_pose.copy()
+        self.sim.rl_tick = 0
+
+    def test_phase_windows_are_inside_reference_double_support(self):
+        self.sim.walk_policy.gait_phase = 0.05
+        self.assertTrue(self.sim._phase_in_switch_window())
+        self.sim.walk_policy.gait_phase = 0.55
+        self.assertTrue(self.sim._phase_in_switch_window())
+        self.sim.walk_policy.gait_phase = 0.25
+        self.assertFalse(self.sim._phase_in_switch_window())
+        self.sim.walk_policy.gait_phase = 0.75
+        self.assertFalse(self.sim._phase_in_switch_window())
+
+    def test_deceleration_is_monotonic_and_keeps_phase_moving(self):
+        self.request("RL_STAND")
+        peaks = []
+        while self.sim._walk_stop_stage != "WAIT_PHASE":
+            self.update()
+            peaks.append(float(np.max(np.abs(self.sim._effective_walk_cmd))))
+        self.assertTrue(np.all(np.diff(peaks) <= 1.0e-12))
+        self.assertGreaterEqual(peaks[-1], self.sim.switch_min_moving_command - 1.0e-12)
+        self.assertGreater(peaks[-1], self.sim.move_command_threshold)
+
+    def test_transition_uses_no_contact_force_or_true_base_velocity(self):
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("MuJoCo-only truth was read by the switch FSM")
+
+        self.sim.foot_contact_forces = forbidden
+        self.sim.base_linear_velocities = forbidden
+        self.request("RL_STAND")
+        for _ in range(1000):
+            if self.sim._walk_stop_stage == "WAIT_PHASE":
+                self.sim.walk_policy.gait_phase = 0.05
+            self.update()
+            if self.sim.state == "RL_STAND":
+                break
+        self.assertEqual(self.sim.state, "RL_STAND")
+
+    def test_stability_is_fail_closed_and_each_limit_can_block(self):
+        stable, _ = self.sim._walk_to_stand_stable(
+            self.q, self.dq, self.quat, self.gyro
+        )
+        self.assertTrue(stable)
+
+        cases = [
+            (self.q, self.dq, np.array([np.nan, 0.0, 0.0, 0.0]), self.gyro),
+            (self.q, self.dq, self.quat, np.array([self.sim.switch_gyro_xy_max, 0.0, 0.0])),
+            (self.q, self.dq, self.quat, np.array([0.0, 0.0, self.sim.switch_gyro_z_max])),
+            (
+                self.q,
+                np.full(self.sim.nj, self.sim.switch_joint_vel_rms_max),
+                self.quat,
+                self.gyro,
+            ),
+            (
+                self.q + self.sim.switch_joint_pos_error_max,
+                self.dq,
+                self.quat,
+                self.gyro,
+            ),
+        ]
+        for q, dq, quat, gyro in cases:
+            with self.subTest(q=q, dq=dq, quat=quat, gyro=gyro):
+                allowed, _ = self.sim._walk_to_stand_stable(q, dq, quat, gyro)
+                self.assertFalse(allowed)
+
+        original_target = self.sim.rl_target.copy()
+        self.sim.rl_target = self.q + self.sim.switch_target_error_max
+        allowed, _ = self.sim._walk_to_stand_stable(
+            self.q, self.dq, self.quat, self.gyro
+        )
+        self.sim.rl_target = original_target
+        self.assertFalse(allowed)
+
+    def test_stability_confirmation_must_be_continuous(self):
+        self.sim.pending_rl_state = "RL_STAND"
+        self.sim._walk_stop_stage = "ZERO_HOLD"
+        self.sim.switch_zero_hold_duration = 0.0
+        self.sim.switch_stable_confirm_duration = 4 * self.sim.control_dt
+        self.update(3)
+        self.assertAlmostEqual(
+            self.sim._walk_stop_stable_elapsed, 3 * self.sim.control_dt
+        )
+        self.gyro[0] = self.sim.switch_gyro_xy_max
+        self.update()
+        self.assertEqual(self.sim._walk_stop_stable_elapsed, 0.0)
+        self.assertEqual(self.sim.state, "RL_WALK")
+
+    def test_operator_cancel_resumes_command_smoothly(self):
+        self.request("RL_STAND")
+        self.update(20)
+        stopped_at = self.sim._effective_walk_cmd.copy()
+        self.request("RL_WALK")
+        self.update()
+        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertLessEqual(
+            np.max(
+                np.abs(self.sim._effective_walk_cmd - stopped_at)
+                - self.sim.walk_command_accel_limits * self.sim.control_dt
+            ),
+            1.0e-12,
+        )
+        self.sim.walk_policy.gait_phase = 0.05
+        self.update(
+            int(
+                np.ceil(
+                    np.max(
+                        np.abs(self.sim.cmd - self.sim._effective_walk_cmd)
+                        / self.sim.walk_command_accel_limits
+                    )
+                    / self.sim.control_dt
+                )
+            )
+            + 2
+        )
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, self.sim.cmd)
+
+    def test_keyboard_only_changes_target_command(self):
+        self.sim.cmd[:] = 0.0
+        self.sim._effective_walk_cmd[:] = 0.0
+        phase_before = self.sim.walk_policy.gait_phase
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._cmd_key("w")
+        self.assertAlmostEqual(self.sim.cmd[0], 0.1)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+        self.assertEqual(self.sim.walk_policy.gait_phase, phase_before)
+        self.update()
+        self.assertGreater(self.sim._effective_walk_cmd[0], 0.0)
+        self.assertLessEqual(
+            self.sim._effective_walk_cmd[0],
+            self.sim.walk_command_accel_limits[0] * self.sim.control_dt + 1.0e-12,
+        )
+
+    def test_max_command_stops_smoothly_at_double_support(self):
+        self.sim.cmd[:] = 0.0
+        self.sim._effective_walk_cmd[:] = [self.sim.max_vel[0], 0.0, 0.0]
+        self.sim.walk_policy.gait_phase = 0.25
+        previous = self.sim._effective_walk_cmd.copy()
+        for _ in range(500):
+            self.update()
+            current = self.sim._effective_walk_cmd.copy()
+            self.assertLessEqual(
+                np.max(
+                    np.abs(current - previous)
+                    - self.sim.walk_command_decel_limits * self.sim.control_dt
+                ),
+                1.0e-12,
+            )
+            previous = current
+            if np.max(np.abs(current)) <= self.sim.switch_min_moving_command + 1.0e-12:
+                break
+        self.assertGreater(
+            np.max(np.abs(self.sim._effective_walk_cmd)),
+            self.sim.move_command_threshold,
+        )
+        self.assertFalse(self.sim._phase_in_switch_window())
+
+        self.sim.walk_policy.gait_phase = 0.05
+        previous = self.sim._effective_walk_cmd.copy()
+        for _ in range(500):
+            self.update()
+            current = self.sim._effective_walk_cmd.copy()
+            self.assertLessEqual(
+                np.max(
+                    np.abs(current - previous)
+                    - self.sim.walk_command_decel_limits * self.sim.control_dt
+                ),
+                1.0e-12,
+            )
+            previous = current
+            if np.max(np.abs(self.sim._effective_walk_cmd)) <= 1.0e-12:
+                break
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0, atol=1.0e-12)
+
+    def test_direction_reversal_crosses_zero_only_at_double_support(self):
+        self.sim.cmd[:] = [-self.sim.max_vel[0], 0.0, 0.0]
+        self.sim._effective_walk_cmd[:] = [self.sim.max_vel[0], 0.0, 0.0]
+        self.sim.walk_policy.gait_phase = 0.25
+        for _ in range(500):
+            self.update()
+        self.assertGreater(self.sim._effective_walk_cmd[0], 0.0)
+        self.assertGreater(
+            abs(self.sim._effective_walk_cmd[0]), self.sim.move_command_threshold
+        )
+
+        self.sim.walk_policy.gait_phase = 0.05
+        crossed_zero = False
+        for _ in range(1000):
+            self.update()
+            if self.sim._effective_walk_cmd[0] <= 0.0:
+                crossed_zero = True
+            if np.allclose(self.sim._effective_walk_cmd, self.sim.cmd, atol=1.0e-12):
+                break
+        self.assertTrue(crossed_zero)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, self.sim.cmd, atol=1.0e-12)
+
+    def test_timeout_keeps_walking_policy_at_zero_command(self):
+        self.sim.pending_rl_state = "RL_STAND"
+        self.sim._walk_stop_stage = "ZERO_HOLD"
+        self.sim._walk_stop_block_reason = "test instability"
+        self.sim.switch_total_timeout = 3 * self.sim.control_dt
+        self.sim.cmd[:] = [0.2, 0.1, 0.0]
+        self.sim._effective_walk_cmd[:] = 0.0
+        self.gyro[0] = self.sim.switch_gyro_xy_max
+        self.update(3)
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertIsNone(self.sim.pending_rl_state)
+        np.testing.assert_allclose(self.sim.cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+
+    def test_policy_history_and_applied_targets_are_continuous(self):
+        previous = np.linspace(-0.5, 0.5, self.sim.walk_policy.n_act).astype(np.float32)
+        previous_previous = previous * 0.5
+        self.sim.walk_policy.last_actions[:] = previous
+        self.sim.walk_policy.last_last_actions[:] = previous_previous
+        leg_target = self.sim.stand_pose + np.linspace(-0.03, 0.03, self.sim.nj)
+        neck_target = self.sim.neck_default + np.linspace(-0.02, 0.02, self.sim.n_neck)
+        self.sim.rl_target = leg_target.copy()
+        self.sim.neck_target = neck_target.copy()
+        self.sim.torso_cmd[:] = [0.01, 0.1, 0.1, 0.05]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._complete_rl_switch("RL_STAND")
+
+        np.testing.assert_allclose(self.sim.stand_policy.last_actions, previous)
+        np.testing.assert_allclose(
+            self.sim.stand_policy.last_last_actions, previous_previous
+        )
+        for value in (
+            self.sim.policy_target_prev,
+            self.sim.policy_target_next,
+            self.sim.filtered_policy_target,
+        ):
+            np.testing.assert_allclose(value, leg_target)
+        for value in (
+            self.sim.neck_policy_target_prev,
+            self.sim.neck_policy_target_next,
+            self.sim.filtered_neck_target,
+        ):
+            np.testing.assert_allclose(value, neck_target)
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_torso_cmd, 0.0)
+        np.testing.assert_allclose(self.sim.cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+
+    def test_switch_to_walk_clears_model_specific_commands(self):
+        self.sim.state = "RL_STAND"
+        self.sim.policy = self.sim.stand_policy
+        self.sim.cmd[:] = [0.2, 0.1, 0.3]
+        self.sim._effective_walk_cmd[:] = self.sim.cmd
+        self.sim.torso_cmd[:] = [0.01, 0.1, 0.1, 0.05]
+        self.sim._effective_torso_cmd[:] = self.sim.torso_cmd
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._complete_rl_switch("RL_WALK")
+
+        self.assertEqual(self.sim.state, "RL_WALK")
+        np.testing.assert_allclose(self.sim.cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_torso_cmd, 0.0)
+
+    def test_stand_to_walk_max_squat_command_ramps_to_neutral(self):
+        self.set_stand([self.sim.torso_command_min[0], 0.0, 0.0, 0.0])
+        start = self.sim._effective_torso_cmd.copy()
+        self.request("RL_WALK")
+        self.update()
+
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertIs(self.sim.policy, self.sim.stand_policy)
+        self.assertEqual(self.sim.pending_rl_state, "RL_WALK")
+        self.assertEqual(self.sim._stand_to_walk_stage, "RECENTER")
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+        self.assertGreater(abs(self.sim._effective_torso_cmd[0]), 0.9 * abs(start[0]))
+        self.assertAlmostEqual(
+            self.sim._stand_to_walk_recenter_duration,
+            self.sim.stand_to_walk_recenter_max_duration,
+        )
+
+        heights = [float(self.sim._effective_torso_cmd[0])]
+        while self.sim._stand_to_walk_stage == "RECENTER":
+            self.update()
+            heights.append(float(self.sim._effective_torso_cmd[0]))
+        self.assertTrue(np.all(np.diff(heights) >= -1.0e-12))
+        self.assertAlmostEqual(heights[-1], 0.0)
+        self.assertEqual(self.sim.state, "RL_STAND")
+
+    def test_stand_to_walk_recenter_duration_scales_with_command(self):
+        cases = [
+            ([0.005, 0.0, 0.0, 0.0], 0.125),
+            ([0.0, self.sim.torso_command_max[1] * 0.5, 0.0, 0.0], 0.5),
+            ([0.0, 0.0, self.sim.torso_command_min[2], 0.0], 1.0),
+            ([self.sim.torso_command_min[0], 0.1, -0.1, 0.05], 1.0),
+        ]
+        for command, expected_ratio in cases:
+            with self.subTest(command=command):
+                self.set_stand(command)
+                self.request("RL_WALK")
+                self.update()
+                self.assertAlmostEqual(
+                    self.sim._stand_to_walk_recenter_duration,
+                    self.sim.stand_to_walk_recenter_max_duration * expected_ratio,
+                    places=6,
+                )
+
+    def test_stand_to_walk_stability_confirmation_must_be_continuous(self):
+        self.set_stand()
+        self.sim.stand_to_walk_zero_hold_duration = 0.0
+        self.sim.stand_to_walk_stable_confirm_duration = 4 * self.sim.control_dt
+        self.request("RL_WALK")
+        self.update(3)
+        self.assertAlmostEqual(
+            self.sim._stand_to_walk_stable_elapsed, 3 * self.sim.control_dt
+        )
+
+        self.gyro[0] = self.sim.switch_gyro_xy_max
+        self.update()
+        self.assertEqual(self.sim._stand_to_walk_stable_elapsed, 0.0)
+        self.assertEqual(self.sim.state, "RL_STAND")
+
+        self.gyro[:] = 0.0
+        self.update(4)
+        self.assertEqual(self.sim.state, "RL_WALK")
+
+    def test_stand_to_walk_cancel_continues_smoothly_to_neutral(self):
+        self.set_stand([self.sim.torso_command_min[0], 0.0, 0.0, 0.0])
+        self.request("RL_WALK")
+        self.update(20)
+        before_cancel = self.sim._effective_torso_cmd.copy()
+
+        self.request("RL_STAND")
+        self.update()
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertIs(self.sim.policy, self.sim.stand_policy)
+        self.assertLess(
+            np.max(np.abs(self.sim._effective_torso_cmd - before_cancel)),
+            1.0e-3,
+        )
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+
+        for _ in range(1000):
+            self.update()
+            if self.sim._stand_to_walk_stage is None:
+                break
+        self.assertIsNone(self.sim._stand_to_walk_stage)
+        np.testing.assert_allclose(self.sim._effective_torso_cmd, 0.0)
+
+    def test_stand_to_walk_timeout_keeps_standing_neutral(self):
+        self.set_stand()
+        self.sim.stand_to_walk_zero_hold_duration = 0.0
+        self.sim.stand_to_walk_total_timeout = 3 * self.sim.control_dt
+        self.gyro[0] = self.sim.switch_gyro_xy_max
+        self.request("RL_WALK")
+        self.update(3)
+
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertIs(self.sim.policy, self.sim.stand_policy)
+        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertIsNone(self.sim._stand_to_walk_stage)
+        np.testing.assert_allclose(self.sim.cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+        np.testing.assert_allclose(self.sim._effective_torso_cmd, 0.0)
+
+    def test_neutral_stand_to_walk_uses_fast_path(self):
+        self.set_stand()
+        self.sim.stand_to_walk_zero_hold_duration = 0.0
+        self.sim.stand_to_walk_stable_confirm_duration = 2 * self.sim.control_dt
+        self.request("RL_WALK")
+        self.update()
+        self.assertEqual(self.sim._stand_to_walk_stage, "ZERO_HOLD")
+        self.assertEqual(self.sim._stand_to_walk_recenter_duration, 0.0)
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.update()
+        self.assertEqual(self.sim.state, "RL_WALK")
+
+
+if __name__ == "__main__":
+    unittest.main()

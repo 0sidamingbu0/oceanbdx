@@ -16,12 +16,25 @@
 - 电机零位=结构限位, URDF零位=站立姿态, 偏移由 `config/oceanbdx.yaml` 的 `calibration` 段管理
 - 策略: 论文 divide-and-conquer **两个独立 ONNX**——站立 `policy/stand/policy.onnx`（77维观测）与行走 `policy/policy.onnx`（80维观测），均输出14维动作；IsaacLab 导出，Python MuJoCo sim2sim 已支持双模型切换，C++ 真机主控仍待升级
 
-两策略切换时保留最近两帧归一化动作、当前腿/脖子目标、path frame 和 FOH/低通状态；
-`RL_WALK → RL_STAND` 会等待下一次确认的双支撑，避免在摆动相中途换策略。站立和行走统一
-使用论文附录 B 的腿部软件 PD `kP=10`、`kD=0.3`，不能再给站立模型单独使用旧高增益 plant。
-walk→stand 会用切换瞬间的实测躯干姿态初始化 standing torso 命令；`STAND_UP→RL_STAND`
-也先从实测躯干姿态起步，再用 `0.5s` 余弦接管平滑回用户/neutral 命令，同时渐入腿/脖子
-策略目标并把脚本 `50/3` 平滑降到 RL `10/0.3`。
+两策略切换时保留最近两帧归一化动作、当前腿/脖子目标、path frame 和 FOH/低通状态；这些
+低层连续状态只用于避免首帧目标角/力矩跳变，不代表新策略继续保持旧策略的姿态命令。
+`RL_WALK → RL_STAND` 由 walking policy 依次完成 `0.6s` 余弦减速、参考双支撑相位归零、
+`0.15s` 最终平滑过零、`0.4s` 零命令收脚和连续 `0.2s` 稳定确认，再切到 standing policy。
+正式放行只使用内部
+步态相位、IMU projected gravity/gyro、腿 `q/dq` 和当前 policy target，不依赖脚底力传感器、
+MuJoCo 真值速度或 CoM。超时后 walking policy 保持零命令，不冒险强制切换。
+
+`RL_STAND → RL_WALK` 不再从蹲姿或倾斜姿态直接切模型。standing policy 先将当前 torso 命令
+用半余弦平滑回到 neutral，回正时长按命令幅度缩放，最大 `1.5s`；neutral 后至少保持 `0.3s`，
+再用同一组 IMU、腿 `q/dq` 和当前 target 连续确认稳定 `0.2s`，最后才切入 walking policy
+零速闭环。切换请求取消后仍继续平滑回 neutral，不恢复旧蹲姿；总计 `5s` 超时则留在
+standing policy neutral，不强制切换，也不关闭电机输出。
+
+站立和行走统一使用论文附录 B 的腿部软件 PD `kP=10`、`kD=0.3`，不能再给站立模型单独
+使用旧高增益 plant。模型互切不恢复旧姿态：进入 standing 时 torso 命令归零并保持 neutral；
+请求进入 walking 时先由 standing policy 平滑回 neutral，切入后速度目标归零。两个模型语义
+相同的 head 命令继续保留。`STAND_UP→RL_STAND`
+仍使用原有 `0.5s` 接管窗渐入腿/脖子策略目标，并把脚本 `50/3` 平滑降到 RL `10/0.3`。
 
 ## 目录结构
 
@@ -84,13 +97,17 @@ python3 sim2sim/mujoco_sim.py                 # 同时加载行走+站立两个 
 python3 sim2sim/mujoco_sim.py --stand-policy policy/stand/policy.onnx   # 覆盖站立 onnx 路径
 python3 sim2sim/diag_walk_policy.py --vx 0.15    # 无界面前进逐脚间隙/力矩/脖子诊断
 python3 sim2sim/diag_walk_policy.py --vx -0.15   # 同口径后退诊断
+python3 -m unittest -v sim2sim/test_walk_stand_switch.py  # 切换/命令平滑回归
 ```
 
 当前 Python sim2sim 会严格检查 stand/walk 输入维度为 `77/80`，旧 74 维站立和 77 维行走
-ONNX 会直接拒绝加载。数字键请求在主控制循环边界消费；行走回站立时，移动状态下会先经历
-单支撑并等待下一双支撑，零速已双脚着地时可直接完成切换，超时则取消请求。path-frame FK
-使用脚 link body origin/quaternion 对齐 IsaacLab，sole geom center 只用于接触；旧算法在 neutral
-pose 会产生约 `2.585cm` 的位置偏差。
+ONNX 会直接拒绝加载。数字键请求在主控制循环边界消费；行走回站立时，速度命令与用户命令
+分离，减速阶段仍保持相位推进，只在训练参考的双支撑相位窗口将策略命令归零。稳定判据任意
+一帧失败都会重置确认计时，`3.5s` 超时后继续由 walking policy 以零命令保持；再次请求行走时
+由统一限加速度器平滑跟踪当前用户命令。普通加速、减速、清零和反向也使用同一控制线程平滑器；
+清零或全向反转只有在参考双支撑窗口才允许穿过移动阈值，避免相位冻结在单支撑。
+path-frame FK 使用脚 link body origin/quaternion 对齐 IsaacLab，
+sole geom center 只用于接触诊断；旧算法在 neutral pose 会产生约 `2.585cm` 的位置偏差。
 
 > **跑 IsaacLab / 需要 torch 的脚本时(如 `sim2sim/scan_ckpt.py`、`export_ckpt_onnx.py`),用 IsaacLab 运行时 python:**
 > ```bash
@@ -105,6 +122,10 @@ pose 会产生约 `2.585cm` 的位置偏差。
 `t/g`=躯干pitch± `v/c`=躯干yaw± `y/b`=躯干roll± `f/z`=躯干高度± (仅 `1` 站立模型态生效)；
 `i/k`=点头 `j/l`=摇头 `u/o`=歪头 `n/m`=头高 `h`=头命令清零 (站立/行走均生效)。
 MuJoCo 窗口内也能按 (方向键映射到 w/s/q/e), 但数字键会附带触发 MuJoCo 的 geomgroup 切换, 故脚本每帧复位可见组防止机器人消失; 推荐还是用终端操作。
+
+键盘/手柄写入的是速度目标，不会直接跳变 policy 命令。默认限加速度为 vx/vy/wz
+`[0.50,0.40,1.50]`，限减速度为 `[0.40,0.30,1.20]`，单位分别为
+`[m/s²,m/s²,rad/s²]`，可在 YAML 的 `command` 段调整。
 
 站立 torso 命令会限幅到训练可行域：h `[-0.04,+0.01]m`、pitch `±0.17rad`、yaw
 `±0.24rad`、roll `±0.09rad`。不要扩大部署限幅让策略外推。

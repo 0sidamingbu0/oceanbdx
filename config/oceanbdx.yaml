@@ -151,6 +151,10 @@ oceanbdx:
     max_vx: 0.25
     max_vy: 0.15
     max_wz: 0.8
+    # 用户命令只作为目标值；实际送入 walking policy 的命令在 200Hz 控制线程限加速度。
+    # 单位分别为 [m/s^2, m/s^2, rad/s^2]。减速到零/反向时还会等待参考双支撑相位过零。
+    walk_command_accel_limits: [0.50, 0.40, 1.50]
+    walk_command_decel_limits: [0.40, 0.30, 1.20]
     # 头部命令范围（与训练侧 head_command_*_range 一致；键盘微调步长见 mujoco_sim）
     max_head_dh: 0.007
     max_head_pitch: 0.17
@@ -170,10 +174,32 @@ oceanbdx:
     rl_kd: [0.3, 0.3, 0.3, 0.3, 0.3,  0.3, 0.3, 0.3, 0.3, 0.3]
     action_lowpass_cutoff_hz: 37.5
     neck_torque_limits: [5.0, 5.0, 5.0, 5.0]
-    # walk -> stand 等待双脚接触连续确认后再切换（论文 Fig.9）。
-    switch_contact_force_threshold: 10.0
-    switch_double_support_confirm_steps: 2
-    switch_double_support_timeout_s: 2.0
+    # walk -> stand：仍由 walking policy 完成减速和零命令收脚，再在参考双支撑相位切换。
+    # 正式判据只使用真机可靠可得的内部相位、IMU projected gravity/gyro 和腿 q/dq/target；
+    # MuJoCo 接触力、真值 base velocity、CoM 不参与放行。
+    switch_decel_duration_s: 0.6
+    switch_min_moving_command: 0.09       # > move_command_threshold，防止单支撑时相位冻结
+    switch_double_support_phase_windows: [[0.02, 0.08], [0.52, 0.58]]
+    switch_final_decel_duration_s: 0.15   # 双支撑窗口内从最小移动命令平滑降到 0
+    switch_zero_hold_duration_s: 0.40     # walking policy 零命令闭环消除惯性
+    switch_stable_confirm_duration_s: 0.20
+    switch_total_timeout_s: 3.5
+    switch_projected_gravity_xy_max: 0.20
+    switch_upright_projection_min: 0.98
+    switch_gyro_xy_max: 0.12
+    switch_gyro_z_max: 0.15
+    switch_joint_vel_rms_max: 0.30
+    switch_joint_vel_max: 0.80
+    switch_joint_pos_error_max: 0.25
+    # 低刚度腿部 PD 从最大命令回零时可有约 0.40rad 的 target-q 稳态偏差；
+    # 该项只拦截明显目标跳变，惯性是否消除主要由 IMU 与 dq 判据决定。
+    switch_target_error_max: 0.50
+    # stand -> walk：先继续使用 standing policy 将任意躯干姿态平滑回 neutral，
+    # 再由 IMU 与编码器连续确认稳定后切换。超时保持 standing policy neutral 闭环。
+    stand_to_walk_recenter_max_duration_s: 1.5
+    stand_to_walk_zero_hold_duration_s: 0.30
+    stand_to_walk_stable_confirm_duration_s: 0.20
+    stand_to_walk_total_timeout_s: 5.0
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机

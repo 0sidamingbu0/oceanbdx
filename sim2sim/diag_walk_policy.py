@@ -64,6 +64,8 @@ def main():
     sim.state, sim.state_time = "STAND_UP", 0.0
     settle_policy_steps = 0
     walk_policy_steps = 0
+    walk_switch_requested = False
+    walk_command_started = False
     last_rl_tick = -1
     samples = []
 
@@ -75,13 +77,16 @@ def main():
             last_rl_tick = sim.rl_tick
             if sim.state == "RL_STAND":
                 settle_policy_steps += 1
-                if settle_policy_steps >= args.settle_steps:
+                if settle_policy_steps >= args.settle_steps and not walk_switch_requested:
                     sim._switch_rl_state("RL_WALK")
-                    sim.cmd[:] = [args.vx, args.vy, args.wz]
-                    sim.walk_policy.gait_phase = 0.1
+                    walk_switch_requested = True
                     last_rl_tick = -1
             else:
                 walk_policy_steps += 1
+
+        if sim.state == "RL_WALK" and not walk_command_started:
+            sim.cmd[:] = [args.vx, args.vy, args.wz]
+            walk_command_started = True
 
         q = sim.data.qpos[sim.q_adr].copy()
         dq = sim.data.qvel[sim.v_adr].copy()

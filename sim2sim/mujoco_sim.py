@@ -546,7 +546,8 @@ class RunLogger:
 
 class Sim:
     def __init__(self, args):
-        full = yaml.safe_load(open(args.config))["oceanbdx"]
+        with open(args.config, encoding="utf-8") as config_file:
+            full = yaml.safe_load(config_file)["oceanbdx"]
         self.cfg = full
         self.nj = len(LEG_JOINTS)
 
@@ -594,20 +595,88 @@ class Sim:
         self.motor_qd_s = 0.1
         cutoff = float(sim2sim_ctrl.get("action_lowpass_cutoff_hz", 37.5))
         self.target_lowpass_alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff * self.control_dt)
-        self.switch_contact_force_threshold = float(
-            sim2sim_ctrl.get("switch_contact_force_threshold", 10.0)
+        self.move_command_threshold = float(
+            full["policy"].get("move_command_threshold", 0.08)
         )
-        self.switch_double_support_confirm_steps = max(
-            1, int(sim2sim_ctrl.get("switch_double_support_confirm_steps", 2))
+        # walk -> stand uses only signals available on the real robot: controller phase,
+        # projected gravity/gyro, leg q/dq and the applied joint target. MuJoCo contact
+        # forces and true base velocity remain diagnostics and are never switch gates.
+        self.switch_decel_duration = max(
+            self.control_dt, float(sim2sim_ctrl.get("switch_decel_duration_s", 0.6))
         )
-        self.switch_double_support_timeout_steps = max(
-            1,
-            int(
-                round(
-                    float(sim2sim_ctrl.get("switch_double_support_timeout_s", 2.0))
-                    / self.control_dt
-                )
+        self.switch_min_moving_command = max(
+            self.move_command_threshold + 1.0e-4,
+            float(sim2sim_ctrl.get("switch_min_moving_command", 0.09)),
+        )
+        phase_windows = np.asarray(
+            sim2sim_ctrl.get(
+                "switch_double_support_phase_windows",
+                [[0.02, 0.08], [0.52, 0.58]],
             ),
+            dtype=float,
+        )
+        if phase_windows.ndim != 2 or phase_windows.shape[1] != 2:
+            raise ValueError("sim2sim.switch_double_support_phase_windows must be Nx2")
+        self.switch_double_support_phase_windows = np.mod(phase_windows, 1.0)
+        self.switch_zero_hold_duration = max(
+            0.0, float(sim2sim_ctrl.get("switch_zero_hold_duration_s", 0.4))
+        )
+        self.switch_final_decel_duration = max(
+            self.control_dt,
+            float(sim2sim_ctrl.get("switch_final_decel_duration_s", 0.15)),
+        )
+        self.switch_stable_confirm_duration = max(
+            self.control_dt,
+            float(sim2sim_ctrl.get("switch_stable_confirm_duration_s", 0.2)),
+        )
+        self.switch_total_timeout = max(
+            self.switch_decel_duration
+            + self.switch_final_decel_duration
+            + self.switch_zero_hold_duration,
+            float(sim2sim_ctrl.get("switch_total_timeout_s", 3.5)),
+        )
+        self.switch_proj_g_xy_max = float(
+            sim2sim_ctrl.get("switch_projected_gravity_xy_max", 0.20)
+        )
+        self.switch_upright_projection_min = float(
+            sim2sim_ctrl.get("switch_upright_projection_min", 0.98)
+        )
+        self.switch_gyro_xy_max = float(sim2sim_ctrl.get("switch_gyro_xy_max", 0.12))
+        self.switch_gyro_z_max = float(sim2sim_ctrl.get("switch_gyro_z_max", 0.15))
+        self.switch_joint_vel_rms_max = float(
+            sim2sim_ctrl.get("switch_joint_vel_rms_max", 0.30)
+        )
+        self.switch_joint_vel_max = float(
+            sim2sim_ctrl.get("switch_joint_vel_max", 0.80)
+        )
+        self.switch_joint_pos_error_max = float(
+            sim2sim_ctrl.get("switch_joint_pos_error_max", 0.25)
+        )
+        self.switch_target_error_max = float(
+            sim2sim_ctrl.get("switch_target_error_max", 0.50)
+        )
+        # stand -> walk remains on the standing policy until its torso command is neutral
+        # and real-robot-available IMU/encoder signals have stayed stable.
+        self.stand_to_walk_recenter_max_duration = max(
+            0.0,
+            float(sim2sim_ctrl.get("stand_to_walk_recenter_max_duration_s", 1.5)),
+        )
+        self.stand_to_walk_zero_hold_duration = max(
+            0.0,
+            float(sim2sim_ctrl.get("stand_to_walk_zero_hold_duration_s", 0.30)),
+        )
+        self.stand_to_walk_stable_confirm_duration = max(
+            self.control_dt,
+            float(sim2sim_ctrl.get("stand_to_walk_stable_confirm_duration_s", 0.20)),
+        )
+        minimum_stand_to_walk_timeout = (
+            self.stand_to_walk_recenter_max_duration
+            + self.stand_to_walk_zero_hold_duration
+            + self.stand_to_walk_stable_confirm_duration
+        )
+        self.stand_to_walk_total_timeout = max(
+            minimum_stand_to_walk_timeout,
+            float(sim2sim_ctrl.get("stand_to_walk_total_timeout_s", 5.0)),
         )
         self.policy_target_prev = np.zeros(self.nj)
         self.policy_target_next = np.zeros(self.nj)
@@ -626,6 +695,20 @@ class Sim:
 
         cmd_cfg = full["command"]
         self.max_vel = np.array([cmd_cfg["max_vx"], cmd_cfg["max_vy"], cmd_cfg["max_wz"]])
+        self.walk_command_accel_limits = np.asarray(
+            cmd_cfg.get("walk_command_accel_limits", [0.50, 0.40, 1.50]),
+            dtype=float,
+        )
+        self.walk_command_decel_limits = np.asarray(
+            cmd_cfg.get("walk_command_decel_limits", [0.40, 0.30, 1.20]),
+            dtype=float,
+        )
+        for name, limits in (
+            ("walk_command_accel_limits", self.walk_command_accel_limits),
+            ("walk_command_decel_limits", self.walk_command_decel_limits),
+        ):
+            if limits.shape != (3,) or not np.all(np.isfinite(limits)) or np.any(limits <= 0.0):
+                raise ValueError(f"command.{name} must contain three positive finite values")
 
         # 真机联调 (--real / --manual)
         self.real_cfg = full.get("real", {})
@@ -727,7 +810,10 @@ class Sim:
         self.head_cmd = np.zeros(4, dtype=np.float32)  # (Δh, pitch, yaw, roll)
         # 站立躯干命令 (h, pitch, yaw, roll)，仅 RL_STAND 生效；默认全 0=标称直立站姿。
         # 键盘微调见 _cmd_key：t/g=pitch± v/c=yaw± y/b=roll± f/z=高度±（切状态清零）。
+        # torso_cmd is the user target. _effective_torso_cmd also carries the scripted
+        # STAND_UP hand-off and the standing-policy recenter before a walk switch.
         self.torso_cmd = np.zeros(4, dtype=np.float32)
+        self._effective_torso_cmd = np.zeros(4, dtype=np.float32)
         cmd_cfg = full.get("command", {})
         # 站立高度命令是不对称范围，必须显式保存 min/max。
         self.torso_command_min = np.array(
@@ -761,9 +847,22 @@ class Sim:
         self.state_time = 0.0
         self._rl_switch_requests = queue.SimpleQueue()
         self.pending_rl_state = None
-        self._double_support_confirm_count = 0
-        self._switch_seen_single_support = False
-        self._switch_wait_steps = 0
+        self._effective_walk_cmd = np.zeros(3, dtype=float)
+        self._walk_stop_stage = None
+        self._walk_stop_start_cmd = np.zeros(3, dtype=float)
+        self._walk_stop_total_elapsed = 0.0
+        self._walk_stop_stage_elapsed = 0.0
+        self._walk_stop_stable_elapsed = 0.0
+        self._walk_stop_block_reason = "idle"
+        self._stand_to_walk_stage = None
+        self._stand_to_walk_total_elapsed = 0.0
+        self._stand_to_walk_stage_elapsed = 0.0
+        self._stand_to_walk_stable_elapsed = 0.0
+        self._stand_to_walk_recenter_duration = 0.0
+        self._stand_to_walk_start_torso_cmd = np.zeros(4, dtype=np.float32)
+        self._stand_to_walk_block_reason = "idle"
+        self._stand_to_walk_cancelled = False
+        self._walk_command_safe_zero_active = False
         self._rl_gain_blend_active = False
         self._rl_gain_blend_elapsed = 0.0
         self._rl_gain_blend_ratio = 1.0
@@ -861,9 +960,22 @@ class Sim:
         self.state_time = 0.0
         self._rl_switch_requests = queue.SimpleQueue()
         self.pending_rl_state = None
-        self._double_support_confirm_count = 0
-        self._switch_seen_single_support = False
-        self._switch_wait_steps = 0
+        self._effective_walk_cmd[:] = 0.0
+        self._walk_stop_stage = None
+        self._walk_stop_start_cmd[:] = 0.0
+        self._walk_stop_total_elapsed = 0.0
+        self._walk_stop_stage_elapsed = 0.0
+        self._walk_stop_stable_elapsed = 0.0
+        self._walk_stop_block_reason = "idle"
+        self._stand_to_walk_stage = None
+        self._stand_to_walk_total_elapsed = 0.0
+        self._stand_to_walk_stage_elapsed = 0.0
+        self._stand_to_walk_stable_elapsed = 0.0
+        self._stand_to_walk_recenter_duration = 0.0
+        self._stand_to_walk_start_torso_cmd[:] = 0.0
+        self._stand_to_walk_block_reason = "idle"
+        self._stand_to_walk_cancelled = False
+        self._walk_command_safe_zero_active = False
         self._rl_gain_blend_active = False
         self._rl_gain_blend_elapsed = 0.0
         self._rl_gain_blend_ratio = 1.0
@@ -887,6 +999,7 @@ class Sim:
         self.filtered_neck_target = self.neck_default.copy()
         self.head_cmd[:] = 0.0
         self.torso_cmd[:] = 0.0
+        self._effective_torso_cmd[:] = 0.0
         for pol in (self.walk_policy, self.stand_policy):
             if pol is not None:
                 pol.reset()
@@ -993,19 +1106,19 @@ class Sim:
         _, lin_vel_b = self.base_linear_velocities()
         return base_xy, head_yaw, feet_center, feet_heading, lin_vel_b
 
-    def _set_stand_command_from_current_pose(self):
-        """Initialize g_perp from the hand-off pose instead of commanding an abrupt zero."""
+    def _stand_command_from_reliable_pose(self, target_command):
+        """Build a hand-off command from signals that are reliable on the real robot.
+
+        Roll and pitch come from the IMU quaternion. Height and path-relative yaw require a
+        state estimator/FK and are therefore kept at the requested standing target instead of
+        using MuJoCo-only truth. This keeps simulation and the future hardware FSM equivalent.
+        """
+        command = np.asarray(target_command, dtype=np.float32).copy()
         quat = self.data.qpos[3:7]
         roll, pitch, _ = rpy_from_quat(quat)
-        head_yaw = yaw_from_quat(quat) + self.head_yaw_offset
-        _, yaw_pf = self.path_frame.base_in_path_frame(self.data.qpos[:2], head_yaw)
-        command = np.array(
-            [self.data.qpos[2] - self.stand_base_height, pitch, yaw_pf, roll],
-            dtype=np.float32,
-        )
-        self.torso_cmd[:] = np.clip(
-            command, self.torso_command_min, self.torso_command_max
-        )
+        command[1] = pitch
+        command[3] = roll
+        return np.clip(command, self.torso_command_min, self.torso_command_max)
 
     def foot_contact_forces(self):
         left_force = 0.0
@@ -1168,7 +1281,6 @@ class Sim:
         与真机 src/main.cpp 一致: 0/1/2/3=状态 9=阻尼 r=重置 p=电机开关
         w/s=vx± a/d=vy± q/e=wz± x=速度清零
         """
-        was_moving = bool(np.max(np.abs(self.cmd)) > self.move_command_threshold)
         if c == "0":
             self.start_real_sit_align()
         elif c == "p":
@@ -1206,10 +1318,9 @@ class Sim:
         elif c == "9":
             self.state = "DAMPING"
             self._rl_switch_requests = queue.SimpleQueue()
-            self.pending_rl_state = None
-            self._double_support_confirm_count = 0
-            self._switch_seen_single_support = False
-            self._switch_wait_steps = 0
+            self._clear_walk_stop_transition()
+            self._clear_stand_to_walk_transition()
+            self._effective_walk_cmd[:] = 0.0
             self._rl_gain_blend_active = False
             self._rl_gain_blend_elapsed = 0.0
             self._rl_gain_blend_ratio = 1.0
@@ -1254,6 +1365,9 @@ class Sim:
             self.head_cmd[:] = 0.0
         # ---- 站立躯干命令（仅 RL_STAND 生效，微调站姿）----
         # t/g=前后倾pitch± v/c=偏航yaw± y/b=侧倾roll± f/z=高度h±
+        elif c in "tgvcybfz" and self._stand_to_walk_stage is not None:
+            print("[FSM] stand->walk 回正中，暂不接受新的 torso 命令")
+            return
         elif c == "t":
             self.torso_cmd[1] = min(self.torso_cmd[1] + 0.05, self.torso_command_max[1])
         elif c == "g":
@@ -1272,18 +1386,12 @@ class Sim:
             self.torso_cmd[0] = max(self.torso_cmd[0] - 0.005, self.torso_command_min[0])
         else:
             return
-        moving_now = bool(np.max(np.abs(self.cmd)) > self.move_command_threshold)
-        if c in "wsadqe" and self.state == "RL_WALK" and moving_now and not was_moving and self.policy:
-            # Start from the appropriate end of double support: positive yaw begins
-            # a left step, negative yaw a right step; translation alternates sides.
-            if abs(float(self.cmd[2])) > 1.0e-4:
-                start_left = self.cmd[2] > 0.0
-            else:
-                start_left = bool(np.random.random() < 0.5)
-            self.policy.gait_phase = 0.1 if start_left else 0.6
         if c in "wsadqex":
             tag = "" if self.state == "RL_WALK" else "  (仅 RL_WALK 生效, 先按2)"
-            print(f"cmd = vx={self.cmd[0]:+.2f} vy={self.cmd[1]:+.2f} wz={self.cmd[2]:+.2f}{tag}")
+            print(
+                f"cmd_target = vx={self.cmd[0]:+.2f} vy={self.cmd[1]:+.2f} "
+                f"wz={self.cmd[2]:+.2f}{tag}"
+            )
         if c in "ikjluonmh":
             print(f"head_cmd = Δh={self.head_cmd[0]:+.3f} pitch={self.head_cmd[1]:+.2f} "
                   f"yaw={self.head_cmd[2]:+.2f} roll={self.head_cmd[3]:+.2f}")
@@ -1296,11 +1404,398 @@ class Sim:
         """Queue a policy switch for the next 200 Hz control-loop boundary.
 
         Keyboard input may arrive on a background thread. It must not mutate policy history or
-        FOH/LPF buffers while inference is running. The main loop consumes this scalar request;
-        walk -> stand then additionally waits for the next confirmed double support.
+        FOH/LPF buffers while inference is running. The main loop consumes this scalar request.
+        Both directions are completed by real-signal-compatible decel/recenter/settle sequences.
         """
         self._rl_switch_requests.put(target)
         print(f"[FSM] switch request queued: {self.state} -> {target}")
+
+    def _clear_walk_stop_transition(self):
+        self.pending_rl_state = None
+        self._walk_stop_stage = None
+        self._walk_stop_total_elapsed = 0.0
+        self._walk_stop_stage_elapsed = 0.0
+        self._walk_stop_stable_elapsed = 0.0
+        self._walk_stop_block_reason = "idle"
+
+    def _clear_stand_to_walk_transition(self):
+        self._stand_to_walk_stage = None
+        self._stand_to_walk_total_elapsed = 0.0
+        self._stand_to_walk_stage_elapsed = 0.0
+        self._stand_to_walk_stable_elapsed = 0.0
+        self._stand_to_walk_recenter_duration = 0.0
+        self._stand_to_walk_start_torso_cmd[:] = 0.0
+        self._stand_to_walk_block_reason = "idle"
+        self._stand_to_walk_cancelled = False
+
+    def _start_gait_from_safe_phase(self, command):
+        if self.walk_policy is None:
+            return
+        # Positive yaw begins a left step, negative yaw a right step; translation alternates.
+        if abs(float(command[2])) > 1.0e-4:
+            start_left = command[2] > 0.0
+        else:
+            start_left = bool(np.random.random() < 0.5)
+        self.walk_policy.gait_phase = 0.1 if start_left else 0.6
+
+    def _update_walk_command_smoothing(self):
+        """Rate-limit policy commands and only cross zero at a safe gait phase."""
+        target = np.clip(np.asarray(self.cmd, dtype=float).copy(), -self.max_vel, self.max_vel)
+        current = self._effective_walk_cmd.copy()
+        was_moving = float(np.max(np.abs(current))) > self.move_command_threshold
+
+        # Commands inside the policy's motion deadband are treated as an explicit stop.
+        if float(np.max(np.abs(target))) <= self.move_command_threshold:
+            target[:] = 0.0
+
+        reversing = current * target < 0.0
+        reducing_magnitude = np.abs(target) < np.abs(current)
+        rate_limits = np.where(
+            reversing | reducing_magnitude,
+            self.walk_command_decel_limits,
+            self.walk_command_accel_limits,
+        )
+        max_delta = rate_limits * self.control_dt
+        candidate = current + np.clip(target - current, -max_delta, max_delta)
+
+        # Do not let the gait clock freeze in single support. Hold a command just above the
+        # motion threshold until a reference double-support window, then continue smoothly
+        # through zero (or into the opposite direction) while the safe phase is frozen.
+        candidate_peak = float(np.max(np.abs(candidate)))
+        current_peak = float(np.max(np.abs(current)))
+        if (
+            not self._walk_command_safe_zero_active
+            and was_moving
+            and candidate_peak < self.switch_min_moving_command
+        ):
+            if self._phase_in_switch_window():
+                self._walk_command_safe_zero_active = True
+            elif current_peak > 1.0e-9:
+                candidate = current / current_peak * self.switch_min_moving_command
+
+        self._effective_walk_cmd[:] = candidate
+        is_moving = float(np.max(np.abs(candidate))) > self.move_command_threshold
+        if is_moving and not was_moving:
+            self._start_gait_from_safe_phase(target)
+        if self._walk_command_safe_zero_active:
+            target_stopped = float(np.max(np.abs(target))) <= self.move_command_threshold
+            reached_zero = float(np.max(np.abs(candidate))) <= 1.0e-9
+            moving_with_target = is_moving and float(np.dot(candidate, target)) > 0.0
+            if (target_stopped and reached_zero) or moving_with_target:
+                self._walk_command_safe_zero_active = False
+
+    def _begin_walk_to_stand(self):
+        self._clear_stand_to_walk_transition()
+        self.pending_rl_state = "RL_STAND"
+        self._walk_command_safe_zero_active = False
+        self._walk_stop_start_cmd[:] = self._effective_walk_cmd
+        self._walk_stop_total_elapsed = 0.0
+        self._walk_stop_stage_elapsed = 0.0
+        self._walk_stop_stable_elapsed = 0.0
+        self._walk_stop_block_reason = "decelerating"
+        if np.max(np.abs(self._walk_stop_start_cmd)) > self.move_command_threshold:
+            self._walk_stop_stage = "DECEL"
+            print(
+                "[FSM] RL_WALK -> WALK_DECEL "
+                f"cmd={np.round(self._walk_stop_start_cmd, 3).tolist()}"
+            )
+        else:
+            self._walk_stop_stage = "ZERO_HOLD"
+            self._effective_walk_cmd[:] = 0.0
+            print("[FSM] RL_WALK -> WALK_ZERO_HOLD (already zero-speed command)")
+
+    def _cancel_walk_to_stand(self, reason, resume_command):
+        stage = self._walk_stop_stage
+        self._clear_walk_stop_transition()
+        if not resume_command:
+            self.cmd[:] = 0.0
+        print(f"[FSM] walk->stand cancelled at {stage}: {reason}")
+
+    def _start_stand_recenter(self):
+        self._stand_to_walk_start_torso_cmd[:] = self._effective_torso_cmd
+        command_extent = np.maximum(
+            np.abs(self.torso_command_min), np.abs(self.torso_command_max)
+        )
+        normalized_offset = float(
+            np.max(
+                np.abs(self._stand_to_walk_start_torso_cmd)
+                / np.maximum(command_extent, 1.0e-6)
+            )
+        )
+        self._stand_to_walk_recenter_duration = (
+            self.stand_to_walk_recenter_max_duration * min(1.0, normalized_offset)
+        )
+        self._stand_to_walk_stage_elapsed = 0.0
+        self._stand_to_walk_stable_elapsed = 0.0
+        if self._stand_to_walk_recenter_duration <= self.control_dt:
+            self._effective_torso_cmd[:] = 0.0
+            self._stand_to_walk_stage = "ZERO_HOLD"
+            self._stand_to_walk_block_reason = "minimum neutral-command hold"
+            print("[FSM] RL_STAND -> STAND_NEUTRAL_HOLD (already neutral)")
+        else:
+            self._stand_to_walk_stage = "RECENTER"
+            self._stand_to_walk_block_reason = "recentering torso command"
+            print(
+                "[FSM] RL_STAND -> STAND_RECENTER "
+                f"duration={self._stand_to_walk_recenter_duration:.2f}s "
+                f"cmd={np.round(self._stand_to_walk_start_torso_cmd, 3).tolist()}"
+            )
+
+    def _begin_stand_to_walk(self):
+        self._clear_walk_stop_transition()
+        self.pending_rl_state = "RL_WALK"
+        self.cmd[:] = 0.0
+        self._effective_walk_cmd[:] = 0.0
+        # Clear the user target immediately, but keep the command applied to the standing
+        # policy continuous. _start_stand_recenter() ramps that effective command to zero.
+        self.torso_cmd[:] = 0.0
+        self._stand_to_walk_total_elapsed = 0.0
+        self._stand_to_walk_stage_elapsed = 0.0
+        self._stand_to_walk_stable_elapsed = 0.0
+        self._stand_to_walk_cancelled = False
+        if self._rl_gain_blend_active:
+            self._stand_to_walk_stage = "WAIT_GAIN_BLEND"
+            self._stand_to_walk_block_reason = "waiting for stand-up policy hand-off"
+            print("[FSM] RL_STAND -> STAND_WAIT_GAIN_BLEND")
+        else:
+            self._start_stand_recenter()
+
+    def _cancel_stand_to_walk(self, reason):
+        stage = self._stand_to_walk_stage
+        self.pending_rl_state = None
+        self.cmd[:] = 0.0
+        self._effective_walk_cmd[:] = 0.0
+        self.torso_cmd[:] = 0.0
+        self._stand_to_walk_cancelled = True
+        if stage == "ZERO_HOLD":
+            self._effective_torso_cmd[:] = 0.0
+            self._clear_stand_to_walk_transition()
+        print(
+            f"[FSM] stand->walk cancelled at {stage}: {reason}; "
+            "remain RL_STAND and continue to neutral"
+        )
+
+    def _phase_in_switch_window(self):
+        if self.walk_policy is None:
+            return True
+        phase = float(self.walk_policy.gait_phase % 1.0)
+        for lo, hi in self.switch_double_support_phase_windows:
+            if lo <= hi:
+                inside = lo <= phase <= hi
+            else:
+                inside = phase >= lo or phase <= hi
+            if inside:
+                return True
+        return False
+
+    def _walk_to_stand_stable(self, q, dq, quat, gyro):
+        """Return a fail-closed stability decision using real-robot-available signals only."""
+        arrays = (q, dq, quat, gyro, self.rl_target)
+        if not all(np.all(np.isfinite(value)) for value in arrays):
+            return False, "non-finite sensor/target"
+
+        projected_gravity = quat_rotate_inverse_gravity(quat)
+        proj_xy = float(np.linalg.norm(projected_gravity[:2]))
+        upright = float(-projected_gravity[2])
+        gyro_xy = float(np.max(np.abs(gyro[:2])))
+        gyro_z = abs(float(gyro[2]))
+        dq_rms = float(np.sqrt(np.mean(np.square(dq))))
+        dq_max = float(np.max(np.abs(dq)))
+        q_error = float(np.max(np.abs(q - self.stand_pose)))
+        target_error = float(np.max(np.abs(self.rl_target - q)))
+
+        blocked = []
+        if proj_xy >= self.switch_proj_g_xy_max:
+            blocked.append(f"proj_xy={proj_xy:.3f}")
+        if upright <= self.switch_upright_projection_min:
+            blocked.append(f"upright={upright:.3f}")
+        if gyro_xy >= self.switch_gyro_xy_max:
+            blocked.append(f"gyro_xy={gyro_xy:.3f}")
+        if gyro_z >= self.switch_gyro_z_max:
+            blocked.append(f"gyro_z={gyro_z:.3f}")
+        if dq_rms >= self.switch_joint_vel_rms_max:
+            blocked.append(f"dq_rms={dq_rms:.3f}")
+        if dq_max >= self.switch_joint_vel_max:
+            blocked.append(f"dq_max={dq_max:.3f}")
+        if q_error >= self.switch_joint_pos_error_max:
+            blocked.append(f"q_err={q_error:.3f}")
+        if target_error >= self.switch_target_error_max:
+            blocked.append(f"target_err={target_error:.3f}")
+        return not blocked, ", ".join(blocked) if blocked else "stable"
+
+    def _stand_to_walk_stable(self, q, dq, quat, gyro):
+        stable, reason = self._walk_to_stand_stable(q, dq, quat, gyro)
+        if not np.all(np.isfinite(self._effective_torso_cmd)):
+            return False, "non-finite torso command"
+        torso_error = float(np.max(np.abs(self._effective_torso_cmd)))
+        if torso_error > 1.0e-6:
+            extra = f"torso_cmd={torso_error:.4f}"
+            return False, f"{reason}, {extra}" if reason != "stable" else extra
+        return stable, reason
+
+    def _update_stand_to_walk(self, q, dq, quat, gyro, policy_boundary):
+        self._stand_to_walk_total_elapsed += self.control_dt
+        if self._stand_to_walk_total_elapsed >= self.stand_to_walk_total_timeout:
+            reason = self._stand_to_walk_block_reason or "transition timeout"
+            self.pending_rl_state = None
+            self.cmd[:] = 0.0
+            self._effective_walk_cmd[:] = 0.0
+            self.torso_cmd[:] = 0.0
+            if self._stand_to_walk_stage in ("WAIT_GAIN_BLEND", "RECENTER"):
+                # Do not turn a timeout into the same torso-command jump this FSM prevents.
+                # Finish the already-running recenter, then remain on the standing policy.
+                self._stand_to_walk_cancelled = True
+                self._stand_to_walk_total_elapsed = 0.0
+            else:
+                self._effective_torso_cmd[:] = 0.0
+                self._clear_stand_to_walk_transition()
+            print(
+                "[FSM] stand->walk timeout after "
+                f"{self.stand_to_walk_total_timeout:.2f}s ({reason}); remain RL_STAND neutral"
+            )
+            return
+
+        if self._stand_to_walk_stage == "WAIT_GAIN_BLEND":
+            if not self._rl_gain_blend_active:
+                self._start_stand_recenter()
+            return
+
+        if self._stand_to_walk_stage == "RECENTER":
+            self._stand_to_walk_stage_elapsed += self.control_dt
+            progress = min(
+                1.0,
+                self._stand_to_walk_stage_elapsed
+                / self._stand_to_walk_recenter_duration,
+            )
+            blend = 0.5 * (1.0 - np.cos(np.pi * progress))
+            self._effective_torso_cmd[:] = (
+                self._stand_to_walk_start_torso_cmd * (1.0 - blend)
+            )
+            if progress >= 1.0:
+                self._effective_torso_cmd[:] = 0.0
+                if self._stand_to_walk_cancelled:
+                    self._clear_stand_to_walk_transition()
+                    print("[FSM] stand->walk cancellation reached neutral; remain RL_STAND")
+                else:
+                    self._stand_to_walk_stage = "ZERO_HOLD"
+                    self._stand_to_walk_stage_elapsed = 0.0
+                    self._stand_to_walk_stable_elapsed = 0.0
+                    self._stand_to_walk_block_reason = "minimum neutral-command hold"
+                    print("[FSM] STAND_RECENTER -> STAND_NEUTRAL_HOLD")
+            return
+
+        if self._stand_to_walk_stage != "ZERO_HOLD":
+            return
+
+        self._effective_torso_cmd[:] = 0.0
+        if self._stand_to_walk_cancelled:
+            self._clear_stand_to_walk_transition()
+            return
+        self._stand_to_walk_stage_elapsed += self.control_dt
+        if self._stand_to_walk_stage_elapsed < self.stand_to_walk_zero_hold_duration:
+            self._stand_to_walk_stable_elapsed = 0.0
+            return
+
+        stable, reason = self._stand_to_walk_stable(q, dq, quat, gyro)
+        self._stand_to_walk_block_reason = reason
+        if stable:
+            self._stand_to_walk_stable_elapsed += self.control_dt
+        else:
+            self._stand_to_walk_stable_elapsed = 0.0
+        if (
+            self._stand_to_walk_stable_elapsed
+            >= self.stand_to_walk_stable_confirm_duration
+            and policy_boundary
+        ):
+            print(
+                "[FSM] STAND_NEUTRAL_HOLD stable "
+                f"for {self._stand_to_walk_stable_elapsed:.2f}s -> RL_WALK"
+            )
+            self._complete_rl_switch("RL_WALK")
+
+    def _update_walk_to_stand(self, q, dq, quat, gyro, policy_boundary):
+        self._walk_stop_total_elapsed += self.control_dt
+        if self._walk_stop_total_elapsed >= self.switch_total_timeout:
+            reason = self._walk_stop_block_reason or "transition timeout"
+            self._cancel_walk_to_stand(
+                f"timeout after {self._walk_stop_total_elapsed:.2f}s ({reason})",
+                resume_command=False,
+            )
+            return
+
+        if self._walk_stop_stage == "DECEL":
+            self._walk_stop_stage_elapsed += self.control_dt
+            progress = min(1.0, self._walk_stop_stage_elapsed / self.switch_decel_duration)
+            blend = 0.5 * (1.0 - np.cos(np.pi * progress))
+            candidate = self._walk_stop_start_cmd * (1.0 - blend)
+            candidate_peak = float(np.max(np.abs(candidate)))
+            start_peak = float(np.max(np.abs(self._walk_stop_start_cmd)))
+            if candidate_peak < self.switch_min_moving_command and start_peak > 1.0e-9:
+                candidate = (
+                    self._walk_stop_start_cmd / start_peak * self.switch_min_moving_command
+                )
+            self._effective_walk_cmd[:] = candidate
+            if progress >= 1.0:
+                self._walk_stop_stage = "WAIT_PHASE"
+                self._walk_stop_stage_elapsed = 0.0
+                self._walk_stop_block_reason = "waiting for expected double support"
+                print("[FSM] WALK_DECEL -> WALK_WAIT_DOUBLE_SUPPORT")
+            return
+
+        if self._walk_stop_stage == "WAIT_PHASE":
+            if self._phase_in_switch_window():
+                self._walk_stop_start_cmd[:] = self._effective_walk_cmd
+                self._walk_stop_stage = "FINAL_DECEL"
+                self._walk_stop_stage_elapsed = 0.0
+                self._walk_stop_stable_elapsed = 0.0
+                self._walk_stop_block_reason = "final double-support deceleration"
+                phase = self.walk_policy.gait_phase if self.walk_policy is not None else 0.0
+                print(
+                    "[FSM] WALK_WAIT_DOUBLE_SUPPORT -> WALK_FINAL_DECEL "
+                    f"phase={phase:.3f}"
+                )
+            return
+
+        if self._walk_stop_stage == "FINAL_DECEL":
+            self._walk_stop_stage_elapsed += self.control_dt
+            progress = min(
+                1.0,
+                self._walk_stop_stage_elapsed / self.switch_final_decel_duration,
+            )
+            blend = 0.5 * (1.0 - np.cos(np.pi * progress))
+            self._effective_walk_cmd[:] = self._walk_stop_start_cmd * (1.0 - blend)
+            if progress >= 1.0:
+                self._effective_walk_cmd[:] = 0.0
+                self._walk_stop_stage = "ZERO_HOLD"
+                self._walk_stop_stage_elapsed = 0.0
+                self._walk_stop_block_reason = "minimum zero-command hold"
+                print("[FSM] WALK_FINAL_DECEL -> WALK_ZERO_HOLD")
+            return
+
+        if self._walk_stop_stage != "ZERO_HOLD":
+            return
+
+        self._effective_walk_cmd[:] = 0.0
+        self._walk_stop_stage_elapsed += self.control_dt
+        if self._walk_stop_stage_elapsed < self.switch_zero_hold_duration:
+            self._walk_stop_stable_elapsed = 0.0
+            return
+
+        stable, reason = self._walk_to_stand_stable(q, dq, quat, gyro)
+        self._walk_stop_block_reason = reason
+        if stable:
+            self._walk_stop_stable_elapsed += self.control_dt
+        else:
+            self._walk_stop_stable_elapsed = 0.0
+        if (
+            self._walk_stop_stable_elapsed >= self.switch_stable_confirm_duration
+            and policy_boundary
+        ):
+            print(
+                "[FSM] WALK_ZERO_HOLD stable "
+                f"for {self._walk_stop_stable_elapsed:.2f}s -> RL_STAND"
+            )
+            self._complete_rl_switch("RL_STAND")
 
     def _complete_rl_switch(self, target):
         """Complete a policy switch while preserving action and setpoint continuity."""
@@ -1308,12 +1803,18 @@ class Sim:
         if target == "RL_WALK":
             target_policy = self.walk_policy
             self.cmd[:] = 0.0  # 切入行走时速度命令归零，等待手动加速
+            self._effective_walk_cmd[:] = 0.0
+            self.torso_cmd[:] = 0.0
+            self._effective_torso_cmd[:] = 0.0
             label = "walk model"
         else:  # RL_STAND
             target_policy = self.stand_policy or self.walk_policy
-            # Start the standing reference at the measured hand-off pose. The policy can then
-            # settle naturally under its action-smoothness terms without a command discontinuity.
-            self._set_stand_command_from_current_pose()
+            # Model switches do not restore a previous torso pose. Enter standing at the
+            # neutral torso command and let the standing policy hold it directly.
+            self.cmd[:] = 0.0
+            self._effective_walk_cmd[:] = 0.0
+            self.torso_cmd[:] = 0.0
+            self._effective_torso_cmd[:] = 0.0
             label = "stand model" if self.stand_policy else "stand(回退行走模型)"
 
         if source_policy is not None:
@@ -1339,14 +1840,15 @@ class Sim:
         self.rl_tick = 0
         self.policy = target_policy
         self.state = target
-        self.pending_rl_state = None
-        self._double_support_confirm_count = 0
-        self._switch_seen_single_support = False
-        self._switch_wait_steps = 0
+        self._effective_walk_cmd[:] = 0.0
+        self._walk_command_safe_zero_active = False
+        self._clear_walk_stop_transition()
+        self._clear_stand_to_walk_transition()
         print(f"[FSM] -> {target} ({label})")
 
-    def _update_pending_rl_switch(self):
+    def _update_pending_rl_switch(self, q, dq, quat, gyro):
         """Consume thread-safe requests and finish transitions at a control boundary."""
+        policy_boundary = self.rl_tick % self.decimation == 0
         requested = None
         while True:
             try:
@@ -1355,70 +1857,39 @@ class Sim:
                 break
         if requested is not None:
             if self.state not in ("RL_STAND", "RL_WALK"):
-                self.pending_rl_state = None
-                self._double_support_confirm_count = 0
-                self._switch_seen_single_support = False
-                self._switch_wait_steps = 0
+                self._clear_walk_stop_transition()
+                self._clear_stand_to_walk_transition()
                 return
             if requested == self.state:
-                if self.pending_rl_state is not None:
+                if self.state == "RL_WALK" and self.pending_rl_state == "RL_STAND":
+                    self._cancel_walk_to_stand("operator requested walk", resume_command=True)
+                elif self.state == "RL_STAND" and self._stand_to_walk_stage is not None:
+                    self._cancel_stand_to_walk("operator requested stand")
+                elif self.pending_rl_state is not None:
+                    self._clear_walk_stop_transition()
                     print(f"[FSM] pending switch cancelled; remain in {self.state}")
-                self.pending_rl_state = None
-                self._double_support_confirm_count = 0
-                self._switch_seen_single_support = False
-                self._switch_wait_steps = 0
             else:
-                self.pending_rl_state = requested
-                self._double_support_confirm_count = 0
-                self._switch_wait_steps = 0
                 if self.state == "RL_WALK" and requested == "RL_STAND":
-                    left_force, right_force = self.foot_contact_forces()
-                    in_double_support = (
-                        left_force >= self.switch_contact_force_threshold
-                        and right_force >= self.switch_contact_force_threshold
-                    )
-                    moving = bool(np.max(np.abs(self.cmd)) > self.move_command_threshold)
-                    # When already walking through double support, wait for single support
-                    # and the following contact edge. At zero command, the current stable
-                    # double support is already a valid hand-off state.
-                    self._switch_seen_single_support = not in_double_support or not moving
-                    suffix = "next " if in_double_support and moving else ""
-                    print(f"[FSM] RL_WALK -> RL_STAND waiting for {suffix}double support")
+                    if self.pending_rl_state != "RL_STAND":
+                        self._begin_walk_to_stand()
+                elif self.state == "RL_STAND" and requested == "RL_WALK":
+                    if self._stand_to_walk_stage is None:
+                        self._begin_stand_to_walk()
+                    else:
+                        self.pending_rl_state = "RL_WALK"
+                        self._stand_to_walk_cancelled = False
+                        print("[FSM] stand->walk transition resumed")
+                else:
+                    self.pending_rl_state = requested
 
-        if self.pending_rl_state is not None and not (
-            self.state == "RL_WALK" and self.pending_rl_state == "RL_STAND"
-        ):
+        if self.state == "RL_WALK" and self.pending_rl_state == "RL_STAND":
+            self._update_walk_to_stand(q, dq, quat, gyro, policy_boundary)
+        elif self.state == "RL_STAND" and self._stand_to_walk_stage is not None:
+            self._update_stand_to_walk(q, dq, quat, gyro, policy_boundary)
+        elif self.pending_rl_state is not None and policy_boundary:
             self._complete_rl_switch(self.pending_rl_state)
-            return
-        if self.pending_rl_state != "RL_STAND" or self.state != "RL_WALK":
-            return
-        self._switch_wait_steps += 1
-        if self._switch_wait_steps >= self.switch_double_support_timeout_steps:
-            print("[FSM] RL_WALK -> RL_STAND cancelled: double-support timeout")
-            self.pending_rl_state = None
-            self._double_support_confirm_count = 0
-            self._switch_seen_single_support = False
-            self._switch_wait_steps = 0
-            return
-        left_force, right_force = self.foot_contact_forces()
-        threshold = self.switch_contact_force_threshold
-        in_double_support = left_force >= threshold and right_force >= threshold
-        if not self._switch_seen_single_support:
-            if not in_double_support:
-                self._switch_seen_single_support = True
-            elif not bool(np.max(np.abs(self.cmd)) > self.move_command_threshold):
-                # A stop command can freeze the phase while both feet remain planted.
-                # That stable zero-speed support is a valid hand-off and must not deadlock.
-                self._switch_seen_single_support = True
-            else:
-                self._double_support_confirm_count = 0
-                return
-        if in_double_support:
-            self._double_support_confirm_count += 1
-        else:
-            self._double_support_confirm_count = 0
-        if self._double_support_confirm_count >= self.switch_double_support_confirm_steps:
-            self._complete_rl_switch("RL_STAND")
+        elif self.state == "RL_WALK":
+            self._update_walk_command_smoothing()
 
     # ---------- 真机输出 ----------
     def disable_real_output(self, reason=""):
@@ -1515,16 +1986,15 @@ class Sim:
             if quat_rotate_inverse_gravity(quat)[2] > -0.5:
                 self.state = "DAMPING"
                 self._rl_switch_requests = queue.SimpleQueue()
-                self.pending_rl_state = None
-                self._double_support_confirm_count = 0
-                self._switch_seen_single_support = False
-                self._switch_wait_steps = 0
+                self._clear_walk_stop_transition()
+                self._clear_stand_to_walk_transition()
+                self._effective_walk_cmd[:] = 0.0
                 self._rl_gain_blend_active = False
                 self._rl_gain_blend_elapsed = 0.0
                 self._rl_gain_blend_ratio = 1.0
                 print("[FSM] attitude protect -> DAMPING")
 
-        self._update_pending_rl_switch()
+        self._update_pending_rl_switch(q, dq, quat, gyro)
 
         if self.state == "SIT":
             target, kp, kd = self.sit_pose, self.fixed_kp, self.fixed_kd
@@ -1553,8 +2023,10 @@ class Sim:
                 _, _, feet_center, feet_heading, _ = self.path_frame_truth()
                 self.path_frame.reset(feet_center, feet_heading)
                 target_torso_command = self.torso_cmd.copy()
-                self._set_stand_command_from_current_pose()
-                self._rl_gain_blend_start_torso_command = self.torso_cmd.copy()
+                self._effective_torso_cmd[:] = self._stand_command_from_reliable_pose(
+                    target_torso_command
+                )
+                self._rl_gain_blend_start_torso_command = self._effective_torso_cmd.copy()
                 self._rl_gain_blend_target_torso_command = target_torso_command
                 self.state, self.state_time = "RL_STAND", 0.0
                 self._rl_gain_blend_active = self.rl_gain_blend_duration > 0.0
@@ -1563,25 +2035,27 @@ class Sim:
                 self._rl_gain_blend_start_target = self.stand_pose.copy()
                 self._rl_gain_blend_start_neck_target = self.neck_default.copy()
                 if not self._rl_gain_blend_active:
-                    self.torso_cmd[:] = self._rl_gain_blend_target_torso_command
+                    self._effective_torso_cmd[:] = self._rl_gain_blend_target_torso_command
                 label = "stand model" if self.stand_policy else "stand(回退行走模型)"
                 print(f"[FSM] STAND_UP -> RL_STAND ({label})")
         elif self.state in ("RL_STAND", "RL_WALK"):
             if self.state == "RL_STAND" and self._rl_gain_blend_active:
                 blend = self._rl_gain_blend_ratio
-                self.torso_cmd[:] = (
+                self._effective_torso_cmd[:] = (
                     self._rl_gain_blend_start_torso_command * (1.0 - blend)
                     + self._rl_gain_blend_target_torso_command * blend
                 )
+            elif self.state == "RL_STAND" and self._stand_to_walk_stage is None:
+                self._effective_torso_cmd[:] = self.torso_cmd
             # 按状态选活动模型：RL_WALK→行走模型(cmd 速度)，RL_STAND→站立模型(torso 命令)
             if self.state == "RL_WALK":
                 self.policy = self.walk_policy
-                cmd = self.cmd
+                cmd = self._effective_walk_cmd
                 torso_cmd = np.zeros(4, dtype=np.float32)
             else:  # RL_STAND
                 self.policy = self.stand_policy or self.walk_policy
                 cmd = np.zeros(3)
-                torso_cmd = self.torso_cmd
+                torso_cmd = self._effective_torso_cmd
             if self.policy is None:
                 target, kp, kd = self.rl_target, self.kp, self.kd  # 无策略兜底: 锁站姿
             else:
@@ -1660,7 +2134,7 @@ class Sim:
                     self._rl_gain_blend_active = False
                     self._rl_gain_blend_ratio = 1.0
                     if self.state == "RL_STAND":
-                        self.torso_cmd[:] = self._rl_gain_blend_target_torso_command
+                        self._effective_torso_cmd[:] = self._rl_gain_blend_target_torso_command
         else:  # DAMPING
             target, kp, kd = q, np.zeros(self.nj), np.full(self.nj, self.damping_kd)
 
