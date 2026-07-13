@@ -23,12 +23,18 @@ def percentile(values, q):
 
 
 def box_ground_clearance(sim, geom_id):
-    """Return the lowest world-space corner height for a MuJoCo box geom."""
-    center_z = float(sim.data.geom_xpos[geom_id, 2])
+    """Return the minimum box-corner clearance above the local terrain."""
+    center = sim.data.geom_xpos[geom_id]
     rotation = sim.data.geom_xmat[geom_id].reshape(3, 3)
     half_size = sim.model.geom_size[geom_id]
-    vertical_extent = float(np.sum(np.abs(rotation[2, :]) * half_size))
-    return center_z - vertical_extent
+    clearances = []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                local_corner = half_size * np.array([sx, sy, sz])
+                corner = center + rotation @ local_corner
+                clearances.append(corner[2] - sim.ground_height_at(corner[:2]))
+    return float(np.nanmin(clearances))
 
 
 def main():

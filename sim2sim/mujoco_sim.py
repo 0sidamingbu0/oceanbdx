@@ -50,6 +50,7 @@ LEG_JOINTS = ["leg_r1_joint", "leg_r2_joint", "leg_r3_joint", "leg_r4_joint", "l
 NECK_JOINTS = ["neck_n1_joint", "neck_n2_joint", "neck_n3_joint", "neck_n4_joint"]
 # 动作向量顺序 = 腿 10 + 脖子 4（与训练侧 action 布局一致），调试打印按此索引
 ACTION_JOINTS = LEG_JOINTS + NECK_JOINTS
+GROUND_GEOM_NAMES = ("floor", "slope_terrain", "rough_terrain")
 
 
 def quat_rotate_inverse_gravity(q):
@@ -781,6 +782,12 @@ class Sim:
         self.foot_geom_ids = [self.model.geom("foot_r").id, self.model.geom("foot_l").id]
         self.foot_body_ids = [int(self.model.geom_bodyid[gid]) for gid in self.foot_geom_ids]
         self.floor_geom_id = self.model.geom("floor").id
+        self.ground_geom_ids = frozenset(
+            self.model.geom(name).id for name in GROUND_GEOM_NAMES
+        )
+        self.ground_geom_group = np.zeros(6, dtype=np.uint8)
+        for geom_id in self.ground_geom_ids:
+            self.ground_geom_group[self.model.geom_group[geom_id]] = 1
         # 左右脚链是镜像的，两个 foot frame 的局部 +x 在 neutral pose 中相反。
         # 从 q=0 模型姿态标定各自到“头部前向”的 yaw offset，运行时再做圆均值。
         mujoco.mj_forward(self.model, self.data)
@@ -1128,7 +1135,7 @@ class Sim:
         for contact_index in range(self.data.ncon):
             contact = self.data.contact[contact_index]
             pair = (contact.geom1, contact.geom2)
-            if self.floor_geom_id not in pair:
+            if self.ground_geom_ids.isdisjoint(pair):
                 continue
             if left_gid not in pair and right_gid not in pair:
                 continue
@@ -1139,6 +1146,34 @@ class Sim:
             if contact.geom1 == right_gid or contact.geom2 == right_gid:
                 right_force += normal_force
         return left_force, right_force
+
+    def ground_height_at(self, xy):
+        """Return the highest terrain surface below a world-space XY point."""
+        ray_z = max(2.0, float(self.data.qpos[2]) + 1.0)
+        geom_id = np.array([-1], dtype=np.int32)
+        distance = mujoco.mj_ray(
+            self.model,
+            self.data,
+            np.array([float(xy[0]), float(xy[1]), ray_z]),
+            np.array([0.0, 0.0, -1.0]),
+            self.ground_geom_group,
+            1,
+            -1,
+            geom_id,
+        )
+        return ray_z - distance if distance >= 0.0 else float("nan")
+
+    def _configure_viewer_camera(self, viewer):
+        """Keep the small robot framed after the arena increases model extent."""
+        base_body_id = self.model.body("base_link").id
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.trackbodyid = base_body_id
+        viewer.cam.fixedcamid = -1
+        viewer.cam.lookat[:] = self.data.xpos[base_body_id]
+        viewer.cam.lookat[2] += 0.10
+        viewer.cam.distance = 1.8
+        viewer.cam.azimuth = 90.0
+        viewer.cam.elevation = -20.0
 
     def foot_geom_heights(self):
         return [float(self.data.geom_xpos[gid, 2]) for gid in self.debug_push_foot_geom_ids]
@@ -2232,6 +2267,7 @@ class Sim:
         print(f"[teleop] 模式={mode}; 拖动滑块调节关节角, 勾选'使能'后才会下发到真机。")
 
         with mujoco.viewer.launch_passive(self.model, self.data) as v:
+            self._configure_viewer_camera(v)
             while v.is_running() and (panel is None or panel.alive()):
                 t0 = time.time()
                 targets = panel.get_targets() if panel else self.cmd_q
@@ -2338,6 +2374,7 @@ class Sim:
         stdin_thread, restore_stdin = self._start_stdin_thread()
         try:
             with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self.key_cb) as v:
+                self._configure_viewer_camera(v)
                 # 记录初始 geom 可见组, 每帧复位; 防止窗口内误按数字键
                 # 触发 MuJoCo 自带 geomgroup 切换把机器人 geom 隐藏。
                 geomgroup0 = np.array(v.opt.geomgroup).copy()

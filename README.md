@@ -98,7 +98,15 @@ python3 sim2sim/mujoco_sim.py --stand-policy policy/stand/policy.onnx   # 覆盖
 python3 sim2sim/diag_walk_policy.py --vx 0.15    # 无界面前进逐脚间隙/力矩/脖子诊断
 python3 sim2sim/diag_walk_policy.py --vx -0.15   # 同口径后退诊断
 python3 -m unittest -v sim2sim/test_walk_stand_switch.py  # 切换/命令平滑回归
+python3 -m unittest -v sim2sim/test_terrain_scene.py      # 地形几何/接触/动力学参数回归
 ```
+
+场景保留原点附近的平地出生区，并提供两个颜色区分的测试场：机器人初始朝世界 `-X`，绿色
+坡道位于正前方 `x=[-4.2,-1.2]m`，直接按 `w` 可依次测试 `5°` 上坡、`1m` 平台和 `5°`
+下坡；棕灰色粗糙区位于初始左侧、中心 `(0,-2.1)m`，按 `a` 可横移进入，也可先左转约
+`90°` 再正向走入。粗糙区为 `2.5m × 2.5m`、`5cm` 网格和 `4mm` 量化高度，保持训练配置
+的 `24mm` 峰谷差；为避免无限平面截掉负高度，整体平移为 `0..24mm`，外围 `0.25m` 平滑
+过渡到平地。viewer 默认跟随 `base_link`，进入远端区域后仍保持机器人在画面中。
 
 当前 Python sim2sim 会严格检查 stand/walk 输入维度为 `77/80`，旧 74 维站立和 77 维行走
 ONNX 会直接拒绝加载。数字键请求在主控制循环边界消费；行走回站立时，速度命令与用户命令
@@ -108,6 +116,8 @@ ONNX 会直接拒绝加载。数字键请求在主控制循环边界消费；行
 清零或全向反转只有在参考双支撑窗口才允许穿过移动阈值，避免相位冻结在单支撑。
 path-frame FK 使用脚 link body origin/quaternion 对齐 IsaacLab，
 sole geom center 只用于接触诊断；旧算法在 neutral pose 会产生约 `2.585cm` 的位置偏差。
+脚底接触力诊断会同时识别平地、坡道和粗糙区；离地间隙按每个脚底 box 角点下方的局部地形
+高度计算，不再把所有区域错误地当作世界 `z=0`。
 
 > **跑 IsaacLab / 需要 torch 的脚本时(如 `sim2sim/scan_ckpt.py`、`export_ckpt_onnx.py`),用 IsaacLab 运行时 python:**
 > ```bash
