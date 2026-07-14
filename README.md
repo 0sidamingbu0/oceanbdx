@@ -32,9 +32,26 @@ standing policy neutral，不强制切换，也不关闭电机输出。
 
 站立和行走统一使用论文附录 B 的腿部软件 PD `kP=10`、`kD=0.3`，不能再给站立模型单独
 使用旧高增益 plant。模型互切不恢复旧姿态：进入 standing 时 torso 命令归零并保持 neutral；
-请求进入 walking 时先由 standing policy 平滑回 neutral，切入后速度目标归零。两个模型语义
-相同的 head 命令继续保留。`STAND_UP→RL_STAND`
+请求进入 walking 时先由 standing policy 平滑回 neutral。键盘手动切换仍将速度目标归零；
+手柄模式切换保留当前摇杆目标，但 effective command 从零限加速度建立。两个模型语义相同的
+head 命令继续保留。`STAND_UP→RL_STAND`
 仍使用原有 `0.5s` 接管窗渐入腿/脖子策略目标，并把脚本 `50/3` 平滑降到 RL `10/0.3`。
+
+遥控逻辑对齐论文附录 C / 表 VII：遥控模式启动时默认请求 standing，起立完成后进入 standing
+policy；`R1` 短按切换站立/
+行走模式，行走中长按 `R1` 将速度增益从默认 `50%` 提高到 `100%`，`A` 明确请求站立。
+摇杆回中只表示零速度，不会自动退出 walking policy。站立时左摇杆控制躯干姿态、右摇杆控制
+头部并在视线极限处加入躯干转动；行走时左摇杆改为前进/转向，`L2/R2` 改为横移，右摇杆
+继续控制头部。也可把 YAML 的 `walk_button_behavior` 改为 `hold`，实现按住 `R1` 才行走；
+该适配默认仍使用 `50%` 速度增益。
+
+站走过渡期间，摇杆始终按当前正在运行的 policy 解释，直到模型真正切换；因此停走减速时
+前进杆不会提前变成 torso pitch。进入 standing 后，左摇杆和 `L2/R2` 必须连续回中 `0.15s`
+才重新使能身体姿态控制，避免未回中的行走命令在切换瞬间变成大幅前倾/侧倾命令。`A` 的
+standing 请求优先于任何重叠的 `R1` 手势。
+
+本项目实测手柄的 `START` 是 `button[11]`，已映射为与键盘 `1` 相同：仿真坐姿时启动
+`STAND_UP` 起立流程；处于 walking 时请求安全减速并切回 standing；已经 standing 时保持不变。
 
 ## 目录结构
 
@@ -93,13 +110,18 @@ pip install -r sim2sim/requirements.txt
 python3 scripts/urdf2mjcf.py                  # 生成 sim2sim/ocean_scene.xml
 python3 sim2sim/mujoco_sim.py --no-policy     # 仅验证起立脚本
 python3 sim2sim/mujoco_sim.py                 # 同时加载行走+站立两个 ONNX 完整验证
+python3 sim2sim/mujoco_sim.py --gamepad       # 启用论文 R1/双摇杆遥控映射 (/dev/input/js0)
 # 站立/行走是两个独立模型: 起立(1)后进站立模型, 按 2 切行走模型, 按 1 切回站立模型
 python3 sim2sim/mujoco_sim.py --stand-policy policy/stand/policy.onnx   # 覆盖站立 onnx 路径
 python3 sim2sim/diag_walk_policy.py --vx 0.15    # 无界面前进逐脚间隙/力矩/脖子诊断
 python3 sim2sim/diag_walk_policy.py --vx -0.15   # 同口径后退诊断
 python3 -m unittest -v sim2sim/test_walk_stand_switch.py  # 切换/命令平滑回归
+python3 -m unittest -v sim2sim/test_gamepad_mapping.py    # 论文遥控器映射回归
 python3 -m unittest -v sim2sim/test_terrain_scene.py      # 地形几何/接触/动力学参数回归
 ```
+
+`--gamepad` 会持续等待并支持热插拔 `/dev/input/js0`。看到终端输出 `[gamepad] connected` 后，
+按手柄 `START` 即可代替键盘 `1` 起立，之后可完全使用上述手柄映射操作。
 
 场景保留原点附近的平地出生区，并提供两个颜色区分的测试场：机器人初始朝世界 `-X`，绿色
 坡道位于正前方 `x=[-4.2,-1.2]m`，直接按 `w` 可依次测试 `5°` 上坡、`1m` 平台和 `5°`
@@ -114,6 +136,12 @@ ONNX 会直接拒绝加载。数字键请求在主控制循环边界消费；行
 一帧失败都会重置确认计时，`3.5s` 超时后继续由 walking policy 以零命令保持；再次请求行走时
 由统一限加速度器平滑跟踪当前用户命令。普通加速、减速、清零和反向也使用同一控制线程平滑器；
 清零或全向反转只有在参考双支撑窗口才允许穿过移动阈值，避免相位冻结在单支撑。
+手柄模式请求同样只在 200Hz 控制线程消费：`R1` 请求停止后复用完整 walk→stand 安全流程；
+过渡中再次请求行走会从当前 effective command 平滑恢复。稳定 neutral 站立已提前累计稳定时间，
+所以 `R1` 请求行走可在下一策略边界切模型；当前摇杆速度目标会保留，但送入 walking policy 的
+effective command 仍从零按限加速度建立。切换超时会锁存失败目标，避免相同输入自动循环重试。
+显式按 `A` 或手柄断连边沿可解除一次 standing 超时锁存并重新执行安全停站；持续不变的输入
+不会循环重试或刷日志。
 path-frame FK 使用脚 link body origin/quaternion 对齐 IsaacLab，
 sole geom center 只用于接触诊断；旧算法在 neutral pose 会产生约 `2.585cm` 的位置偏差。
 脚底接触力诊断会同时识别平地、坡道和粗糙区；离地间隙按每个脚底 box 角点下方的局部地形
@@ -133,9 +161,13 @@ sole geom center 只用于接触诊断；旧算法在 neutral pose 会产生约 
 `i/k`=点头 `j/l`=摇头 `u/o`=歪头 `n/m`=头高 `h`=头命令清零 (站立/行走均生效)。
 MuJoCo 窗口内也能按 (方向键映射到 w/s/q/e), 但数字键会附带触发 MuJoCo 的 geomgroup 切换, 故脚本每帧复位可见组防止机器人消失; 推荐还是用终端操作。
 
-键盘/手柄写入的是速度目标，不会直接跳变 policy 命令。默认限加速度为 vx/vy/wz
+键盘以及手柄行走模式写入的是速度目标，不会直接跳变 policy 命令。默认限加速度为 vx/vy/wz
 `[0.50,0.40,1.50]`，限减速度为 `[0.40,0.30,1.20]`，单位分别为
 `[m/s²,m/s²,rad/s²]`，可在 YAML 的 `command` 段调整。
+
+论文手柄默认映射见 YAML `puppeteering` 段。不同 USB 手柄的 Linux axis/button 编号并不统一，
+更换设备后先运行 `./build/test_gamepad /dev/input/js0` 核对；断开设备时 Python 输入会立即归零并
+请求站立，C++ `GamepadDriver::GetState()` 也不会再返回拔出前遗留的摇杆值。
 
 站立 torso 命令会限幅到训练可行域：h `[-0.04,+0.01]m`、pitch `±0.17rad`、yaw
 `±0.24rad`、roll `±0.09rad`。不要扩大部署限幅让策略外推。
@@ -148,6 +180,7 @@ sim2sim 与 IsaacLab 不一致时, 尤其是外力后单脚支撑发散、横漂
 > stand77/walk80 双模型闭环。`sim2sim/mujoco_sim.py --real` 只是把 MuJoCo 闭环生成的目标角
 > 通过 UDP/485 桥发送到真机，策略观测仍来自 MuJoCo，不是真机 IMU、关节状态和估计器驱动的
 > 完整闭环，也不能作为真机无缝切换已经完成的依据。
+> 本次 `--gamepad` 映射和双模型切换仍位于 Python sim2sim；C++ 侧本轮只修复了手柄断连快照清零。
 
 ```bash
 sudo cp config/udev/99-oceanbdx.rules /etc/udev/rules.d/   # 按实际硬件改匹配条件

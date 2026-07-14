@@ -13,19 +13,20 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 
 用法 (在 oceanbdx 根目录):
     python3 sim2sim/mujoco_sim.py [--policy policy/policy.onnx] [--config config/oceanbdx.yaml]
+    python3 sim2sim/mujoco_sim.py --gamepad       # 使用论文附录 C 的 R1/双摇杆映射
     python3 sim2sim/mujoco_sim.py --no-policy     # 无策略, 只验证起立脚本与RL接管状态机
     python3 sim2sim/mujoco_sim.py --manual        # 纯sim: 拖动滑块摆关节角
     python3 sim2sim/mujoco_sim.py --real --no-policy # 仿真目标角→真机, 面板显示真机误差
     python3 sim2sim/mujoco_sim.py --real --manual # 真机联调: 拖动滑块→PD下发到真机
     # ★ --real 需先安装 unitree_actuator_sdk, 且停掉 C++ 主控 oceanbdx_run (串口互斥)
-    # 默认每次 policy 推理把 观测+raw/clip动作+目标角 写入 runlog/sim2sim_<时间戳>.csv,
-    # 并在终端刷新 state/cmd/高度/倾斜/速度/|act|max/饱和数; 用 --no-log 关闭。
+    # 默认每次 policy 推理把 观测+raw/clip动作+目标角 写入 runlog/sim2sim_<时间戳>.csv；
+    # 用 --no-log 关闭 CSV 记录。
 
 键盘 (★推荐聚焦“终端窗口”操作, 与真机 main.cpp 一致, 不触发 MuJoCo 快捷键):
     0 = 真机缓慢到蹲姿   1 = 起立/切站立模型   2 = 切行走模型   3 = 切站立模型(同1)   9 = 阻尼   r = 重置
     p = 真机电机输出开关
     w/s = vx±0.1   a/d = vy±0.1   q/e = wz±0.1   x = 速度清零
-    (速度指令仅在 RL_WALK 行走模型生效, 先按 2 进入行走)
+    (未启用 --gamepad 时，速度指令仅在 RL_WALK 行走模型生效，先按 2 进入行走)
     t/g = 躯干pitch±   v/c = 躯干yaw±   y/b = 躯干roll±   f/z = 躯干高度±
     (躯干位姿命令仅在 RL_STAND 站立模型生效, 先按 1 进入站立)
     MuJoCo 窗口内也可按同样的键(方向键映射到 w/s/q/e), 但数字键会附带触发
@@ -41,6 +42,11 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import yaml
+
+try:
+    from .gamepad_input import GamepadSnapshot, LinuxJoystick, PuppeteeringMapper
+except ImportError:
+    from gamepad_input import GamepadSnapshot, LinuxJoystick, PuppeteeringMapper
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCENE_XML = os.path.join(ROOT, "sim2sim/ocean_scene.xml")
@@ -480,17 +486,14 @@ class Policy:
 
 
 class RunLogger:
-    """把每个 policy step 的观测/动作/姿态写入带时间戳的 CSV (runlog/),
-    并按节流间隔在终端刷新关键参数, 便于实时观察策略是否生效。
+    """把每个 policy step 的观测/动作/姿态写入带时间戳的 CSV (runlog/)。
 
     每行 = 一次 policy 推理 (RL_BALANCE / RL_WALK 下 decimation 对齐时)。
     观测拆成各物理量分列, 动作记录 raw(网络原始) / clip(裁剪后) / target(下发关节角)。
     """
 
-    def __init__(self, nj, term_interval=0.3, path=None):
+    def __init__(self, nj, path=None):
         self.nj = nj
-        self.term_interval = float(term_interval)
-        self._last_term = -1e9
         os.makedirs(os.path.join(ROOT, "runlog"), exist_ok=True)
         if path is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -525,18 +528,6 @@ class RunLogger:
                + [f"{v:.4f}" for v in action]
                + [f"{v:.4f}" for v in target])
         self.f.write(",".join(row) + "\n")
-
-        if t - self._last_term >= self.term_interval:
-            self._last_term = t
-            sat = int(np.sum(np.abs(action) > 0.98))
-            print(
-                f"[run] t={t:6.2f} {state:10s} "
-                f"cmd=[{cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f}] "
-                f"z={base_z:.3f} tilt=[{tilt[0]:+.3f},{tilt[1]:+.3f}] "
-                f"vel_b=[{vel_b[0]:+.2f},{vel_b[1]:+.2f}] "
-                f"|act|max={np.max(np.abs(action)):.2f} sat={sat}/{self.nj} "
-                f"|dq|max={np.max(np.abs(dq)):.2f}"
-            )
 
     def close(self):
         try:
@@ -840,6 +831,22 @@ class Sim:
             float(cmd_cfg.get("max_head_yaw", 0.33)),
             float(cmd_cfg.get("max_head_roll", 0.20)),
         ], dtype=np.float32)
+        self.puppeteering_cfg = full.get("puppeteering", {})
+        self.gamepad_enabled = bool(getattr(args, "gamepad", False))
+        self.gamepad = None
+        self.puppeteer = PuppeteeringMapper(
+            self.puppeteering_cfg,
+            self.max_vel,
+            self.torso_command_min,
+            self.torso_command_max,
+            self.max_head,
+        )
+        self._puppeteer_walk_requested = False
+        self._puppeteer_connected = False
+        self._puppeteer_full_speed = False
+        self._puppeteer_explicit_stand_request = False
+        self._puppeteer_blocked_target = None
+        self._stand_ready_elapsed = 0.0
         self.neck_kp = float(pcfg_full.get("neck_kp", 50.0))
         self.neck_kd = float(pcfg_full.get("neck_kd", 2.0))
         neck_default = pcfg_full.get("neck_default_dof_pos", [0.0] * self.n_neck)
@@ -861,6 +868,7 @@ class Sim:
         self._walk_stop_stage_elapsed = 0.0
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "idle"
+        self._walk_stop_source = None
         self._stand_to_walk_stage = None
         self._stand_to_walk_total_elapsed = 0.0
         self._stand_to_walk_stage_elapsed = 0.0
@@ -869,6 +877,9 @@ class Sim:
         self._stand_to_walk_start_torso_cmd = np.zeros(4, dtype=np.float32)
         self._stand_to_walk_block_reason = "idle"
         self._stand_to_walk_cancelled = False
+        self._stand_to_walk_source = None
+        self._stand_to_walk_preserve_walk_command = False
+        self._stand_to_walk_preconfirmed_stable = False
         self._walk_command_safe_zero_active = False
         self._rl_gain_blend_active = False
         self._rl_gain_blend_elapsed = 0.0
@@ -974,6 +985,7 @@ class Sim:
         self._walk_stop_stage_elapsed = 0.0
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "idle"
+        self._walk_stop_source = None
         self._stand_to_walk_stage = None
         self._stand_to_walk_total_elapsed = 0.0
         self._stand_to_walk_stage_elapsed = 0.0
@@ -982,7 +994,17 @@ class Sim:
         self._stand_to_walk_start_torso_cmd[:] = 0.0
         self._stand_to_walk_block_reason = "idle"
         self._stand_to_walk_cancelled = False
+        self._stand_to_walk_source = None
+        self._stand_to_walk_preserve_walk_command = False
+        self._stand_to_walk_preconfirmed_stable = False
         self._walk_command_safe_zero_active = False
+        self.puppeteer.reset()
+        self._puppeteer_walk_requested = False
+        self._puppeteer_connected = False
+        self._puppeteer_full_speed = False
+        self._puppeteer_explicit_stand_request = False
+        self._puppeteer_blocked_target = None
+        self._stand_ready_elapsed = 0.0
         self._rl_gain_blend_active = False
         self._rl_gain_blend_elapsed = 0.0
         self._rl_gain_blend_ratio = 1.0
@@ -1435,15 +1457,130 @@ class Sim:
             print(f"torso_cmd = h={self.torso_cmd[0]:+.3f} pitch={self.torso_cmd[1]:+.2f} "
                   f"yaw={self.torso_cmd[2]:+.2f} roll={self.torso_cmd[3]:+.2f}{tag}")
 
-    def _switch_rl_state(self, target):
+    def _apply_puppeteering_snapshot(self, snapshot: GamepadSnapshot):
+        """Apply one consistent controller snapshot on the 200 Hz control thread."""
+        was_connected = self._puppeteer_connected
+        mapped = self.puppeteer.update(
+            snapshot,
+            self.control_dt,
+            active_walking=self.state == "RL_WALK",
+        )
+        self._puppeteer_walk_requested = mapped.walk_requested
+        self._puppeteer_connected = mapped.connected
+        self._puppeteer_full_speed = mapped.full_speed
+        self._puppeteer_explicit_stand_request = mapped.stand_requested
+        if (
+            mapped.stand_requested
+            or mapped.start_requested
+            or (was_connected and not mapped.connected)
+        ) and self._puppeteer_blocked_target == "RL_STAND":
+            self._puppeteer_blocked_target = None
+        if mapped.start_requested and self.state == "SIT":
+            self._cmd_key("1")
+        self.head_cmd[:] = mapped.head_command
+        if mapped.walk_requested:
+            self.cmd[:] = mapped.walk_command
+            self.torso_cmd[:] = 0.0
+        else:
+            self.cmd[:] = 0.0
+            if self.state == "RL_STAND" and self._stand_to_walk_stage is None:
+                self.torso_cmd[:] = mapped.torso_command
+            else:
+                self.torso_cmd[:] = 0.0
+
+    def _poll_gamepad(self):
+        if not self.gamepad_enabled:
+            return
+        snapshot = self.gamepad.snapshot() if self.gamepad is not None else GamepadSnapshot.zero()
+        self._apply_puppeteering_snapshot(snapshot)
+
+    def _update_puppeteering_switch(self, q, dq, quat, gyro):
+        """Turn the persistent R1 mode request into safe policy-switch requests."""
+        if not self.gamepad_enabled:
+            return
+
+        if (
+            self.state == "RL_STAND"
+            and self._stand_to_walk_stage is None
+            and not self._rl_gain_blend_active
+        ):
+            stable, _ = self._stand_to_walk_stable(q, dq, quat, gyro)
+            if stable:
+                self._stand_ready_elapsed += self.control_dt
+            else:
+                self._stand_ready_elapsed = 0.0
+        else:
+            self._stand_ready_elapsed = 0.0
+
+        desired = "RL_WALK" if self._puppeteer_walk_requested else "RL_STAND"
+        if self._puppeteer_blocked_target is not None and self._puppeteer_blocked_target != desired:
+            self._puppeteer_blocked_target = None
+        if self._puppeteer_blocked_target == desired:
+            return
+        if self.state not in ("RL_STAND", "RL_WALK"):
+            return
+
+        if desired == "RL_WALK" and self.walk_policy is None:
+            self._puppeteer_blocked_target = desired
+            print("[gamepad] walking requested but no walking policy is loaded")
+            return
+        if desired == "RL_STAND" and self.stand_policy is None:
+            self._puppeteer_blocked_target = desired
+            print("[gamepad] standing requested but no standing policy is loaded")
+            return
+
+        if desired == "RL_WALK":
+            if self.state == "RL_STAND" and self._stand_to_walk_stage is None:
+                preconfirmed = (
+                    self._stand_ready_elapsed >= self.stand_to_walk_stable_confirm_duration
+                )
+                self._switch_rl_state(
+                    "RL_WALK",
+                    source="gamepad",
+                    preserve_walk_command=True,
+                    preconfirmed_stable=preconfirmed,
+                )
+            elif (
+                self.state == "RL_WALK"
+                and self.pending_rl_state == "RL_STAND"
+                and self._walk_stop_source == "gamepad"
+            ):
+                self._switch_rl_state(
+                    "RL_WALK", source="gamepad", preserve_walk_command=True
+                )
+        else:
+            if self.state == "RL_WALK" and self.pending_rl_state != "RL_STAND":
+                self._switch_rl_state("RL_STAND", source="gamepad")
+            elif (
+                self.state == "RL_STAND"
+                and self._stand_to_walk_stage is not None
+                and not self._stand_to_walk_cancelled
+                and self._stand_to_walk_source == "gamepad"
+            ):
+                self._switch_rl_state("RL_STAND", source="gamepad")
+
+    def _switch_rl_state(
+        self,
+        target,
+        *,
+        source="operator",
+        preserve_walk_command=False,
+        preconfirmed_stable=False,
+    ):
         """Queue a policy switch for the next 200 Hz control-loop boundary.
 
         Keyboard input may arrive on a background thread. It must not mutate policy history or
         FOH/LPF buffers while inference is running. The main loop consumes this scalar request.
         Both directions are completed by real-signal-compatible decel/recenter/settle sequences.
         """
-        self._rl_switch_requests.put(target)
-        print(f"[FSM] switch request queued: {self.state} -> {target}")
+        request = (
+            target,
+            str(source),
+            bool(preserve_walk_command),
+            bool(preconfirmed_stable),
+        )
+        self._rl_switch_requests.put(request)
+        print(f"[FSM] {source} switch request queued: {self.state} -> {target}")
 
     def _clear_walk_stop_transition(self):
         self.pending_rl_state = None
@@ -1452,6 +1589,7 @@ class Sim:
         self._walk_stop_stage_elapsed = 0.0
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "idle"
+        self._walk_stop_source = None
 
     def _clear_stand_to_walk_transition(self):
         self._stand_to_walk_stage = None
@@ -1462,6 +1600,9 @@ class Sim:
         self._stand_to_walk_start_torso_cmd[:] = 0.0
         self._stand_to_walk_block_reason = "idle"
         self._stand_to_walk_cancelled = False
+        self._stand_to_walk_source = None
+        self._stand_to_walk_preserve_walk_command = False
+        self._stand_to_walk_preconfirmed_stable = False
 
     def _start_gait_from_safe_phase(self, command):
         if self.walk_policy is None:
@@ -1519,9 +1660,10 @@ class Sim:
             if (target_stopped and reached_zero) or moving_with_target:
                 self._walk_command_safe_zero_active = False
 
-    def _begin_walk_to_stand(self):
+    def _begin_walk_to_stand(self, source="operator"):
         self._clear_stand_to_walk_transition()
         self.pending_rl_state = "RL_STAND"
+        self._walk_stop_source = source
         self._walk_command_safe_zero_active = False
         self._walk_stop_start_cmd[:] = self._effective_walk_cmd
         self._walk_stop_total_elapsed = 0.0
@@ -1541,9 +1683,12 @@ class Sim:
 
     def _cancel_walk_to_stand(self, reason, resume_command):
         stage = self._walk_stop_stage
+        source = self._walk_stop_source
         self._clear_walk_stop_transition()
         if not resume_command:
             self.cmd[:] = 0.0
+        if source == "gamepad" and not resume_command:
+            self._puppeteer_blocked_target = "RL_STAND"
         print(f"[FSM] walk->stand cancelled at {stage}: {reason}")
 
     def _start_stand_recenter(self):
@@ -1576,10 +1721,19 @@ class Sim:
                 f"cmd={np.round(self._stand_to_walk_start_torso_cmd, 3).tolist()}"
             )
 
-    def _begin_stand_to_walk(self):
+    def _begin_stand_to_walk(
+        self,
+        source="operator",
+        preserve_walk_command=False,
+        preconfirmed_stable=False,
+    ):
         self._clear_walk_stop_transition()
         self.pending_rl_state = "RL_WALK"
-        self.cmd[:] = 0.0
+        self._stand_to_walk_source = source
+        self._stand_to_walk_preserve_walk_command = bool(preserve_walk_command)
+        self._stand_to_walk_preconfirmed_stable = bool(preconfirmed_stable)
+        if not preserve_walk_command:
+            self.cmd[:] = 0.0
         self._effective_walk_cmd[:] = 0.0
         # Clear the user target immediately, but keep the command applied to the standing
         # policy continuous. _start_stand_recenter() ramps that effective command to zero.
@@ -1594,9 +1748,14 @@ class Sim:
             print("[FSM] RL_STAND -> STAND_WAIT_GAIN_BLEND")
         else:
             self._start_stand_recenter()
+            if self._stand_to_walk_preconfirmed_stable and self._stand_to_walk_stage == "ZERO_HOLD":
+                self._stand_to_walk_stage_elapsed = self.stand_to_walk_zero_hold_duration
+                self._stand_to_walk_stable_elapsed = self.stand_to_walk_stable_confirm_duration
+                self._stand_to_walk_block_reason = "preconfirmed stable standing"
 
     def _cancel_stand_to_walk(self, reason):
         stage = self._stand_to_walk_stage
+        source = self._stand_to_walk_source
         self.pending_rl_state = None
         self.cmd[:] = 0.0
         self._effective_walk_cmd[:] = 0.0
@@ -1605,6 +1764,8 @@ class Sim:
         if stage == "ZERO_HOLD":
             self._effective_torso_cmd[:] = 0.0
             self._clear_stand_to_walk_transition()
+        if source == "gamepad":
+            self._puppeteer_blocked_target = None
         print(
             f"[FSM] stand->walk cancelled at {stage}: {reason}; "
             "remain RL_STAND and continue to neutral"
@@ -1672,10 +1833,15 @@ class Sim:
         self._stand_to_walk_total_elapsed += self.control_dt
         if self._stand_to_walk_total_elapsed >= self.stand_to_walk_total_timeout:
             reason = self._stand_to_walk_block_reason or "transition timeout"
+            source = self._stand_to_walk_source
+            preserve_walk_command = self._stand_to_walk_preserve_walk_command
             self.pending_rl_state = None
-            self.cmd[:] = 0.0
+            if not preserve_walk_command:
+                self.cmd[:] = 0.0
             self._effective_walk_cmd[:] = 0.0
             self.torso_cmd[:] = 0.0
+            if source == "gamepad":
+                self._puppeteer_blocked_target = "RL_WALK"
             if self._stand_to_walk_stage in ("WAIT_GAIN_BLEND", "RECENTER"):
                 # Do not turn a timeout into the same torso-command jump this FSM prevents.
                 # Finish the already-running recenter, then remain on the standing policy.
@@ -1835,9 +2001,21 @@ class Sim:
     def _complete_rl_switch(self, target):
         """Complete a policy switch while preserving action and setpoint continuity."""
         source_policy = self.policy
+        switch_source = (
+            self._stand_to_walk_source if target == "RL_WALK" else self._walk_stop_source
+        )
+        preserve_walk_command = (
+            target == "RL_WALK" and self._stand_to_walk_preserve_walk_command
+        )
+        requested_walk_command = np.clip(
+            np.asarray(self.cmd, dtype=float).copy(), -self.max_vel, self.max_vel
+        )
         if target == "RL_WALK":
             target_policy = self.walk_policy
-            self.cmd[:] = 0.0  # 切入行走时速度命令归零，等待手动加速
+            if preserve_walk_command:
+                self.cmd[:] = requested_walk_command
+            else:
+                self.cmd[:] = 0.0
             self._effective_walk_cmd[:] = 0.0
             self.torso_cmd[:] = 0.0
             self._effective_torso_cmd[:] = 0.0
@@ -1877,20 +2055,31 @@ class Sim:
         self.state = target
         self._effective_walk_cmd[:] = 0.0
         self._walk_command_safe_zero_active = False
+        self._stand_ready_elapsed = 0.0
         self._clear_walk_stop_transition()
         self._clear_stand_to_walk_transition()
-        print(f"[FSM] -> {target} ({label})")
+        source_text = f", source={switch_source}" if switch_source else ""
+        print(f"[FSM] -> {target} ({label}{source_text})")
 
     def _update_pending_rl_switch(self, q, dq, quat, gyro):
         """Consume thread-safe requests and finish transitions at a control boundary."""
         policy_boundary = self.rl_tick % self.decimation == 0
-        requested = None
+        request = None
         while True:
             try:
-                requested = self._rl_switch_requests.get_nowait()
+                request = self._rl_switch_requests.get_nowait()
             except queue.Empty:
                 break
-        if requested is not None:
+        if request is not None:
+            if isinstance(request, str):
+                requested, source, preserve_walk_command, preconfirmed_stable = (
+                    request,
+                    "operator",
+                    False,
+                    False,
+                )
+            else:
+                requested, source, preserve_walk_command, preconfirmed_stable = request
             if self.state not in ("RL_STAND", "RL_WALK"):
                 self._clear_walk_stop_transition()
                 self._clear_stand_to_walk_transition()
@@ -1906,13 +2095,20 @@ class Sim:
             else:
                 if self.state == "RL_WALK" and requested == "RL_STAND":
                     if self.pending_rl_state != "RL_STAND":
-                        self._begin_walk_to_stand()
+                        self._begin_walk_to_stand(source=source)
                 elif self.state == "RL_STAND" and requested == "RL_WALK":
                     if self._stand_to_walk_stage is None:
-                        self._begin_stand_to_walk()
+                        self._begin_stand_to_walk(
+                            source=source,
+                            preserve_walk_command=preserve_walk_command,
+                            preconfirmed_stable=preconfirmed_stable,
+                        )
                     else:
                         self.pending_rl_state = "RL_WALK"
                         self._stand_to_walk_cancelled = False
+                        self._stand_to_walk_source = source
+                        self._stand_to_walk_preserve_walk_command = preserve_walk_command
+                        self._stand_to_walk_preconfirmed_stable = preconfirmed_stable
                         print("[FSM] stand->walk transition resumed")
                 else:
                     self.pending_rl_state = requested
@@ -2029,6 +2225,8 @@ class Sim:
                 self._rl_gain_blend_ratio = 1.0
                 print("[FSM] attitude protect -> DAMPING")
 
+        self._poll_gamepad()
+        self._update_puppeteering_switch(q, dq, quat, gyro)
         self._update_pending_rl_switch(q, dq, quat, gyro)
 
         if self.state == "SIT":
@@ -2355,6 +2553,25 @@ class Sim:
               f"({sim_steps_per_ctrl} substeps), policy {'ON' if self.policy else 'OFF'}")
         print(__doc__)
 
+        if self.gamepad_enabled:
+            device = str(
+                self.puppeteering_cfg.get(
+                    "device", self.cfg.get("hardware", {}).get("gamepad_device", "/dev/input/js0")
+                )
+            )
+            self.gamepad = LinuxJoystick(device)
+            self.gamepad.start()
+            if self.puppeteer.walk_button_behavior == "hold":
+                print(
+                    "[gamepad] deadman mapping enabled: default standing; hold R1 to walk, "
+                    "release R1 to request a safe standing transition; START=key 1"
+                )
+            else:
+                print(
+                    "[gamepad] paper mapping enabled: default standing; R1 short press toggles "
+                    "walk, R1 hold selects full speed, A requests standing, START=key 1"
+                )
+
         if self.want_real:
             from real_bridge import RealBridge
             self.bridge = RealBridge(self.cfg)
@@ -2398,6 +2615,8 @@ class Sim:
                 self.run_logger.close()
             if self.bridge:
                 self.bridge.stop()
+            if self.gamepad:
+                self.gamepad.stop()
             if self.real_panel:
                 self.real_panel.close()
 
@@ -2408,6 +2627,8 @@ if __name__ == "__main__":
     ap.add_argument("--policy", default=None, help="覆盖config中的行走policy路径")
     ap.add_argument("--stand-policy", default=None,
                     help="覆盖config中的站立policy路径 (policy.stand_path)")
+    ap.add_argument("--gamepad", action="store_true",
+                    help="启用论文附录C的USB手柄站立/行走模式与命令映射")
     ap.add_argument("--no-policy", action="store_true", help="仅验证起立脚本, 不加载策略")
     ap.add_argument("--real", action="store_true",
                     help="连接真机电机: 普通sim2sim中输出仿真目标角; 与 --manual 组合时为滑块联调")

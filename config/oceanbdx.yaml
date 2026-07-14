@@ -165,6 +165,35 @@ oceanbdx:
     torso_command_min: [-0.04, -0.17, -0.24, -0.09]
     torso_command_max: [0.01, 0.17, 0.24, 0.09]
 
+  # ---- 论文附录 C / 表 VII 遥控映射（sim2sim --gamepad）----
+  puppeteering:
+    device: /dev/input/js0
+    axis_deadzone: 0.08
+    # 论文默认：R1短按切换站/走，walking中长按R1把速度增益从50%提高到100%。
+    # 如需 deadman 语义可改为 hold；松开后仍走同一安全减速流程回 standing。
+    walk_button_behavior: toggle
+    r1_hold_duration_s: 0.35
+    normal_walk_gain: 0.50
+    full_walk_gain: 1.00
+    hold_walk_gain: 0.50         # 仅 hold 模式使用，默认保持保守半速
+    # 从 walking 返回 standing 后，左摇杆与 L2/R2 必须连续回中后才重新控制 torso。
+    posture_rearm_duration_s: 0.15
+    # 站立时右摇杆前75%把头部送到局部极限，剩余25%逐渐加入躯干转动扩展视线。
+    gaze_torso_threshold: 0.75
+    # 本项目手柄实测 Linux joystick 映射；更换手柄后先运行 build/test_gamepad 核对。
+    mapping:
+      axis_left_x: 0
+      axis_left_y: 1
+      axis_right_x: 2
+      axis_right_y: 3
+      axis_dpad_x: 6
+      axis_dpad_y: 7
+      button_a: 0
+      button_r1: 7
+      button_l2: 8
+      button_r2: 9
+      button_start: 11             # 与 test_gamepad 的 kBtnStart 一致；功能同键盘 1
+
   # ---- MuJoCo sim2sim 专用覆盖 ----
   # Isaac Lab 训练的 walking actuator model 在 MuJoCo 中用显式 torque PD 复刻；
   # 两个RL策略必须使用同一套训练侧附录B执行器，策略切换时低层动力学才连续。

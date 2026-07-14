@@ -54,6 +54,30 @@ class WalkStandSwitchTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.sim._switch_rl_state(target)
 
+    def gamepad_update(self, snapshot, count=1):
+        self.sim.gamepad_enabled = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(count):
+                self.sim._apply_puppeteering_snapshot(snapshot)
+                self.sim._update_puppeteering_switch(
+                    self.q, self.dq, self.quat, self.gyro
+                )
+                self.sim._update_pending_rl_switch(
+                    self.q, self.dq, self.quat, self.gyro
+                )
+
+    @staticmethod
+    def gamepad_snapshot(axes=None, buttons=None, connected=True):
+        axis_values = np.zeros(8, dtype=np.float32)
+        button_values = np.zeros(16, dtype=np.int8)
+        if axes:
+            for index, value in axes.items():
+                axis_values[index] = value
+        if buttons:
+            for index, value in buttons.items():
+                button_values[index] = value
+        return ms.GamepadSnapshot(axis_values, button_values, connected)
+
     def set_stand(self, torso_command=None):
         self.sim._clear_walk_stop_transition()
         self.sim._clear_stand_to_walk_transition()
@@ -442,6 +466,169 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.assertEqual(self.sim.state, "RL_STAND")
         self.update()
         self.assertEqual(self.sim.state, "RL_WALK")
+
+    def test_gamepad_centered_stick_does_not_leave_requested_walk_mode(self):
+        self.sim.puppeteer.walk_requested = True
+        self.gamepad_update(self.gamepad_snapshot())
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertIsNone(self.sim.pending_rl_state)
+        np.testing.assert_allclose(self.sim.cmd, 0.0)
+
+    def test_gamepad_start_from_sit_runs_the_same_stand_up_path_as_key_1(self):
+        self.sim.state = "SIT"
+        self.sim.gamepad_enabled = True
+        self.gamepad_update(self.gamepad_snapshot(buttons={11: 1}))
+
+        self.assertEqual(self.sim.state, "STAND_UP")
+        self.assertEqual(self.sim.state_time, 0.0)
+
+    def test_gamepad_start_from_walk_uses_the_safe_standing_transition(self):
+        self.sim.puppeteer.walk_requested = True
+        self.gamepad_update(self.gamepad_snapshot(buttons={11: 1}))
+
+        self.assertFalse(self.sim._puppeteer_walk_requested)
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
+        self.assertEqual(self.sim._walk_stop_stage, "DECEL")
+        self.assertEqual(self.sim._walk_stop_source, "gamepad")
+
+    def test_gamepad_r1_stop_reuses_safe_walk_to_stand_transition(self):
+        self.sim.puppeteer.walk_requested = True
+        self.gamepad_update(self.gamepad_snapshot(buttons={7: 1}))
+        self.gamepad_update(self.gamepad_snapshot())
+
+        self.assertFalse(self.sim._puppeteer_walk_requested)
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
+        self.assertEqual(self.sim._walk_stop_source, "gamepad")
+        self.assertEqual(self.sim._walk_stop_stage, "DECEL")
+        np.testing.assert_allclose(self.sim.cmd, 0.0)
+        self.assertGreater(np.max(np.abs(self.sim._effective_walk_cmd)), 0.0)
+
+    def test_gamepad_retoggle_walk_cancels_an_active_stop(self):
+        self.sim.puppeteer.walk_requested = True
+        self.gamepad_update(self.gamepad_snapshot(buttons={7: 1}))
+        self.gamepad_update(self.gamepad_snapshot())
+        stopped_at = self.sim._effective_walk_cmd.copy()
+
+        self.gamepad_update(self.gamepad_snapshot(axes={1: -1.0}, buttons={7: 1}))
+        self.gamepad_update(self.gamepad_snapshot(axes={1: -1.0}))
+
+        self.assertTrue(self.sim._puppeteer_walk_requested)
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertLessEqual(
+            np.max(
+                np.abs(self.sim._effective_walk_cmd - stopped_at)
+                - self.sim.walk_command_accel_limits * self.sim.control_dt
+            ),
+            1.0e-12,
+        )
+
+    def test_gamepad_stand_to_walk_preserves_target_and_slews_effective_command(self):
+        self.set_stand()
+        self.sim.gamepad_enabled = True
+        neutral = self.gamepad_snapshot()
+        ready_steps = int(
+            np.ceil(
+                self.sim.stand_to_walk_stable_confirm_duration / self.sim.control_dt
+            )
+        )
+        self.gamepad_update(neutral, ready_steps)
+
+        forward_pressed = self.gamepad_snapshot(buttons={7: 1})
+        forward_released = self.gamepad_snapshot(axes={1: -1.0})
+        self.gamepad_update(forward_pressed)
+        self.gamepad_update(forward_released)
+
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertAlmostEqual(self.sim.cmd[0], self.sim.max_vel[0] * 0.5)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+
+        self.gamepad_update(forward_released)
+        self.assertGreater(self.sim._effective_walk_cmd[0], 0.0)
+        self.assertLessEqual(
+            self.sim._effective_walk_cmd[0],
+            self.sim.walk_command_accel_limits[0] * self.sim.control_dt + 1.0e-12,
+        )
+
+    def test_gamepad_release_requires_posture_inputs_to_return_neutral(self):
+        self.sim.puppeteer.posture_rearm_duration = 3 * self.sim.control_dt
+        walking = self.gamepad_snapshot(
+            axes={1: -1.0}, buttons={7: 1, 8: 1}
+        )
+        released_with_inputs_held = self.gamepad_snapshot(
+            axes={1: -1.0}, buttons={8: 1}
+        )
+
+        self.sim.puppeteer.walk_requested = True
+        self.gamepad_update(walking)
+        self.gamepad_update(released_with_inputs_held)
+        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._complete_rl_switch("RL_STAND")
+        self.gamepad_update(released_with_inputs_held, 10)
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertFalse(self.sim.puppeteer.posture_inputs_armed)
+        np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
+
+        self.gamepad_update(self.gamepad_snapshot(), 4)
+        self.assertTrue(self.sim.puppeteer.posture_inputs_armed)
+        self.gamepad_update(released_with_inputs_held)
+        self.assertAlmostEqual(self.sim.torso_cmd[1], self.sim.torso_command_max[1])
+        self.assertAlmostEqual(self.sim.torso_cmd[3], self.sim.torso_command_max[3])
+
+    def test_gamepad_cancelled_recenter_is_not_requeued_each_control_step(self):
+        self.set_stand([self.sim.torso_command_min[0], 0.0, 0.0, 0.0])
+        self.sim.gamepad_enabled = True
+
+        self.gamepad_update(self.gamepad_snapshot(buttons={7: 1}))
+        self.gamepad_update(self.gamepad_snapshot())
+        self.assertEqual(self.sim._stand_to_walk_stage, "RECENTER")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.sim._apply_puppeteering_snapshot(
+                self.gamepad_snapshot(buttons={7: 1})
+            )
+            self.sim._update_puppeteering_switch(self.q, self.dq, self.quat, self.gyro)
+            self.sim._update_pending_rl_switch(self.q, self.dq, self.quat, self.gyro)
+            self.sim._apply_puppeteering_snapshot(self.gamepad_snapshot())
+            self.sim._update_puppeteering_switch(self.q, self.dq, self.quat, self.gyro)
+            self.sim._update_pending_rl_switch(self.q, self.dq, self.quat, self.gyro)
+            for _ in range(10):
+                self.sim._apply_puppeteering_snapshot(self.gamepad_snapshot())
+                self.sim._update_puppeteering_switch(self.q, self.dq, self.quat, self.gyro)
+                self.sim._update_pending_rl_switch(self.q, self.dq, self.quat, self.gyro)
+
+        self.assertTrue(self.sim._stand_to_walk_cancelled)
+        self.assertEqual(output.getvalue().count("stand->walk cancelled"), 1)
+
+    def test_gamepad_switch_timeout_is_latched_until_mode_changes(self):
+        self.sim.gamepad_enabled = True
+        self.sim.puppeteer.walk_requested = False
+        self.sim.pending_rl_state = "RL_STAND"
+        self.sim._walk_stop_source = "gamepad"
+        self.sim._walk_stop_stage = "ZERO_HOLD"
+        self.sim._walk_stop_block_reason = "test instability"
+        self.sim.switch_total_timeout = 2 * self.sim.control_dt
+        self.gyro[0] = self.sim.switch_gyro_xy_max
+
+        neutral = self.gamepad_snapshot()
+        self.gamepad_update(neutral, 2)
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertEqual(self.sim._puppeteer_blocked_target, "RL_STAND")
+
+        self.gamepad_update(neutral, 20)
+        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertIsNone(self.sim._walk_stop_stage)
+
+        self.gamepad_update(self.gamepad_snapshot(buttons={0: 1}))
+        self.assertIsNone(self.sim._puppeteer_blocked_target)
+        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
 
 
 if __name__ == "__main__":

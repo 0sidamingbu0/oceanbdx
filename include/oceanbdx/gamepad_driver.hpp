@@ -2,7 +2,7 @@
  * OceanBDX - USB 手柄驱动 (Linux joystick API, /dev/input/jsX)
  *
  * 适用于 USB 2.4G 无线手柄 / 有线手柄, 直接读取内核 joystick 设备, 无需 ROS / WiFi。
- * 独立线程读取, 原子量无锁发布。
+ * 独立线程读取, 互斥保护一致状态快照。
  *
  * 实测映射 (以本项目所用手柄为准):
  *   axes[]   : 0=左摇杆X  1=左摇杆Y  2=右摇杆X  3=右摇杆Y  6=方向键X  7=方向键Y
@@ -16,6 +16,7 @@
 #include "oceanbdx/types.hpp"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -60,7 +61,7 @@ public:
     bool Start();
     void Stop();
 
-    // 无锁读取当前状态快照
+    // 读取当前一致状态快照
     GamepadState GetState() const;
     bool IsConnected() const { return connected_.load(); }
 
@@ -74,9 +75,10 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
 
-    // 双缓冲无锁发布
+    // 双缓冲发布；互斥避免连续事件覆盖读者正在复制的缓冲区。
     GamepadState buf_[2];
     std::atomic<int> front_{0};
+    mutable std::mutex state_mutex_;
 };
 
 } // namespace oceanbdx

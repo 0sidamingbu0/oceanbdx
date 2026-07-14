@@ -63,10 +63,9 @@ struct VelocityCommand
 };
 
 // USB 手柄状态 (标准 XInput/2.4G 手柄, 如罗技 F710)
-// 轴下标 (Linux joystick API 标准映射):
-//   0=左摇杆X 1=左摇杆Y 2=LT 3=右摇杆X 4=右摇杆Y 5=RT 6=方向键X 7=方向键Y
-// 按键下标:
-//   0=A 1=B 2=X 3=Y 4=LB 5=RB 6=back 7=start 8=power 9=左摇杆按下 10=右摇杆按下
+// 本项目手柄的实测映射见 gamepad_driver.hpp；不同 XInput 设备可能不同，部署前用
+// test_gamepad 核对并同步配置。当前轴 0/1=左摇杆、2/3=右摇杆、6/7=方向键；
+// 按键 0/1/3/4=A/B/X/Y、6/7=L1/R1、8/9=L2/R2、10/11=Select/Start。
 struct GamepadState
 {
     std::array<double, 8> axes{};     // 归一化 (-1..1; 扳机部分设备为 0..1)

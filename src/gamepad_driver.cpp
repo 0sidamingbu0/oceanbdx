@@ -34,10 +34,13 @@ bool GamepadDriver::Start()
         return false;
     }
 
-    buf_[0] = GamepadState{};
-    buf_[1] = GamepadState{};
-    front_.store(0);
-    connected_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        buf_[0] = GamepadState{};
+        buf_[1] = GamepadState{};
+        front_.store(0);
+        connected_.store(true);
+    }
     running_ = true;
     thread_ = std::thread(&GamepadDriver::ReadLoop, this);
     return true;
@@ -52,13 +55,21 @@ void GamepadDriver::Stop()
         close(fd_);
         fd_ = -1;
     }
-    connected_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        connected_.store(false);
+    }
 }
 
 GamepadState GamepadDriver::GetState() const
 {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!connected_.load())
+    {
+        return GamepadState{};
+    }
     GamepadState s = buf_[front_.load(std::memory_order_acquire)];
-    s.connected = connected_.load();
+    s.connected = true;
     return s;
 }
 
@@ -88,9 +99,12 @@ void GamepadDriver::ReadLoop()
                 break;
             }
 
-            int back = 1 - front_.load(std::memory_order_relaxed);
-            buf_[back] = cur;
-            front_.store(back, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                int back = 1 - front_.load(std::memory_order_relaxed);
+                buf_[back] = cur;
+                front_.store(back, std::memory_order_release);
+            }
         }
         else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
@@ -100,7 +114,10 @@ void GamepadDriver::ReadLoop()
         else if (n < 0)
         {
             // 设备被拔出等错误
-            connected_.store(false);
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                connected_.store(false);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }

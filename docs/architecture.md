@@ -48,7 +48,7 @@ oceanbdx/
 │   ├── leg_driver            # 单腿485总线驱动 (线程+无锁缓存, 输出轴单位)
 │   ├── imu_driver            # IMU线程 (双缓冲无锁发布)
 │   ├── neck_driver           # 脖子驱动封装 (暂不启用)
-│   ├── gamepad_driver        # USB手柄 (Linux joystick, 双缓冲无锁发布)
+│   ├── gamepad_driver        # USB手柄 (Linux joystick, 互斥保护一致快照)
 │   ├── battery_driver        # 电池BMS A5串口协议 (线程收发, 双缓冲发布)
 │   ├── calibration           # 电机零位↔URDF零位换算 + 上电坐姿校验
 │   ├── policy                # ONNX策略推理 (观测构造与IsaacLab对齐)
