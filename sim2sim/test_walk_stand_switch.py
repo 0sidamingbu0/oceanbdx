@@ -223,6 +223,21 @@ class WalkStandSwitchTest(unittest.TestCase):
             self.sim.walk_command_accel_limits[0] * self.sim.control_dt + 1.0e-12,
         )
 
+    def test_persistent_head_command_is_clipped_for_active_policy(self):
+        self.sim.head_cmd[:] = self.sim.stand_max_head
+        self.sim.state = "RL_WALK"
+        np.testing.assert_allclose(
+            self.sim._active_policy_head_command(), self.sim.walk_max_head
+        )
+        # Keep the requested standing pose intact so it can become active again after switching
+        # back; only the observation sent to walking is clipped.
+        np.testing.assert_allclose(self.sim.head_cmd, self.sim.stand_max_head)
+
+        self.sim.state = "RL_STAND"
+        np.testing.assert_allclose(
+            self.sim._active_policy_head_command(), self.sim.stand_max_head
+        )
+
     def test_max_command_stops_smoothly_at_double_support(self):
         self.sim.cmd[:] = 0.0
         self.sim._effective_walk_cmd[:] = [self.sim.max_vel[0], 0.0, 0.0]
@@ -474,6 +489,34 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.assertIsNone(self.sim.pending_rl_state)
         np.testing.assert_allclose(self.sim.cmd, 0.0)
 
+    def test_gamepad_normal_lateral_command_clears_policy_deadband(self):
+        speed = self.sim.puppeteer.min_lateral_walk_speed
+        max_step = self.sim.walk_command_accel_limits[1] * self.sim.control_dt
+        steps = int(np.ceil(speed / max_step)) + 2
+
+        for button, direction in ((8, 1.0), (9, -1.0)):
+            with self.subTest(button=button):
+                self.sim.puppeteer.walk_requested = True
+                self.sim.cmd[:] = 0.0
+                self.sim._effective_walk_cmd[:] = 0.0
+                self.sim._walk_command_safe_zero_active = False
+                previous = 0.0
+
+                for _ in range(steps):
+                    self.gamepad_update(self.gamepad_snapshot(buttons={button: 1}))
+                    current = float(self.sim._effective_walk_cmd[1])
+                    self.assertAlmostEqual(self.sim.cmd[1], direction * speed)
+                    np.testing.assert_allclose(self.sim.cmd[[0, 2]], 0.0)
+                    self.assertGreater(direction * current, 0.0)
+                    self.assertGreaterEqual(
+                        direction * current + 1.0e-12, direction * previous
+                    )
+                    self.assertLessEqual(abs(current - previous), max_step + 1.0e-12)
+                    previous = current
+
+                self.assertGreater(abs(self.sim.cmd[1]), self.sim.move_command_threshold)
+                self.assertAlmostEqual(previous, direction * speed)
+
     def test_gamepad_start_from_sit_runs_the_same_stand_up_path_as_key_1(self):
         self.sim.state = "SIT"
         self.sim.gamepad_enabled = True
@@ -512,6 +555,14 @@ class WalkStandSwitchTest(unittest.TestCase):
         stopped_at = self.sim._effective_walk_cmd.copy()
 
         self.gamepad_update(self.gamepad_snapshot(axes={1: -1.0}, buttons={7: 1}))
+        resumed_at_press = self.sim._effective_walk_cmd.copy()
+        self.assertLessEqual(
+            np.max(
+                np.abs(resumed_at_press - stopped_at)
+                - self.sim.walk_command_accel_limits * self.sim.control_dt
+            ),
+            1.0e-12,
+        )
         self.gamepad_update(self.gamepad_snapshot(axes={1: -1.0}))
 
         self.assertTrue(self.sim._puppeteer_walk_requested)
@@ -519,7 +570,7 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.assertIsNone(self.sim.pending_rl_state)
         self.assertLessEqual(
             np.max(
-                np.abs(self.sim._effective_walk_cmd - stopped_at)
+                np.abs(self.sim._effective_walk_cmd - resumed_at_press)
                 - self.sim.walk_command_accel_limits * self.sim.control_dt
             ),
             1.0e-12,
@@ -536,10 +587,9 @@ class WalkStandSwitchTest(unittest.TestCase):
         )
         self.gamepad_update(neutral, ready_steps)
 
-        forward_pressed = self.gamepad_snapshot(buttons={7: 1})
+        forward_pressed = self.gamepad_snapshot(axes={1: -1.0}, buttons={7: 1})
         forward_released = self.gamepad_snapshot(axes={1: -1.0})
         self.gamepad_update(forward_pressed)
-        self.gamepad_update(forward_released)
 
         self.assertEqual(self.sim.state, "RL_WALK")
         self.assertAlmostEqual(self.sim.cmd[0], self.sim.max_vel[0] * 0.5)
@@ -551,6 +601,33 @@ class WalkStandSwitchTest(unittest.TestCase):
             self.sim._effective_walk_cmd[0],
             self.sim.walk_command_accel_limits[0] * self.sim.control_dt + 1.0e-12,
         )
+
+    def test_gamepad_prepositioned_stick_survives_full_stand_recenter(self):
+        self.set_stand([0.0, self.sim.torso_command_max[1], 0.0, 0.0])
+        self.sim.gamepad_enabled = True
+        full_forward_pressed = self.gamepad_snapshot(
+            axes={1: -1.0}, buttons={7: 1}
+        )
+        full_forward_released = self.gamepad_snapshot(axes={1: -1.0})
+
+        self.gamepad_update(full_forward_pressed)
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertEqual(self.sim._stand_to_walk_stage, "RECENTER")
+        self.assertAlmostEqual(self.sim.cmd[0], self.sim.max_vel[0] * 0.5)
+
+        self.gamepad_update(full_forward_released)
+        for _ in range(1000):
+            if self.sim.state == "RL_WALK":
+                break
+            self.gamepad_update(full_forward_released)
+
+        self.assertEqual(self.sim.state, "RL_WALK")
+        self.assertAlmostEqual(self.sim.cmd[0], self.sim.max_vel[0] * 0.5)
+        np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+
+        self.gamepad_update(full_forward_released)
+        expected_step = self.sim.walk_command_accel_limits[0] * self.sim.control_dt
+        self.assertAlmostEqual(self.sim._effective_walk_cmd[0], expected_step)
 
     def test_gamepad_release_requires_posture_inputs_to_return_neutral(self):
         self.sim.puppeteer.posture_rearm_duration = 3 * self.sim.control_dt

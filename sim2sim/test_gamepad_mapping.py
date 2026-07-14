@@ -22,6 +22,7 @@ class PuppeteeringMapperTest(unittest.TestCase):
             "r1_hold_duration_s": 0.35,
             "normal_walk_gain": 0.5,
             "full_walk_gain": 1.0,
+            "min_lateral_walk_speed": 0.09,
             "posture_rearm_duration_s": 0.04,
             "gaze_torso_threshold": 0.75,
             "mapping": {
@@ -86,6 +87,34 @@ class PuppeteeringMapperTest(unittest.TestCase):
         command = self.short_press_r1()
         self.assertFalse(command.walk_requested)
 
+    def test_r1_press_starts_walk_with_prepositioned_stick(self):
+        full_forward = self.snapshot(axes={1: -1.0}, buttons={7: 1})
+        command = self.mapper.update(full_forward, 0.02)
+
+        self.assertTrue(command.walk_requested)
+        self.assertAlmostEqual(command.walk_command[0], self.max_vel[0] * 0.5)
+
+        command = self.mapper.update(self.snapshot(axes={1: -1.0}), 0.02)
+        self.assertTrue(command.walk_requested)
+        self.assertAlmostEqual(command.walk_command[0], self.max_vel[0] * 0.5)
+
+    def test_r1_hold_can_start_walk_and_raise_gain(self):
+        command = None
+        for _ in range(20):
+            command = self.mapper.update(
+                self.snapshot(axes={1: -1.0}, buttons={7: 1}), 0.02
+            )
+
+        self.assertIsNotNone(command)
+        self.assertTrue(command.walk_requested)
+        self.assertTrue(command.full_speed)
+        self.assertAlmostEqual(command.walk_command[0], self.max_vel[0])
+
+        command = self.mapper.update(self.snapshot(axes={1: -1.0}), 0.02)
+        self.assertTrue(command.walk_requested)
+        self.assertFalse(command.full_speed)
+        self.assertAlmostEqual(command.walk_command[0], self.max_vel[0] * 0.5)
+
     def test_long_r1_hold_selects_full_gain_without_toggling(self):
         self.short_press_r1()
         command = None
@@ -135,7 +164,8 @@ class PuppeteeringMapperTest(unittest.TestCase):
     def test_project_yaml_matches_the_tested_gamepad_indices(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "config/oceanbdx.yaml"), encoding="utf-8") as stream:
-            mapping = yaml.safe_load(stream)["oceanbdx"]["puppeteering"]["mapping"]
+            project = yaml.safe_load(stream)["oceanbdx"]
+        mapping = project["puppeteering"]["mapping"]
         self.assertEqual(
             mapping,
             {
@@ -151,6 +181,14 @@ class PuppeteeringMapperTest(unittest.TestCase):
                 "button_r2": 9,
                 "button_start": 11,
             },
+        )
+        self.assertGreater(
+            project["puppeteering"]["min_lateral_walk_speed"],
+            project["policy"]["move_command_threshold"],
+        )
+        self.assertLessEqual(
+            project["puppeteering"]["min_lateral_walk_speed"],
+            project["command"]["max_vy"],
         )
 
     def test_standing_left_stick_moves_torso_and_counter_rotates_head(self):
@@ -182,14 +220,47 @@ class PuppeteeringMapperTest(unittest.TestCase):
         self.assertAlmostEqual(command.torso_command[2], self.torso_min[2])
         self.assertAlmostEqual(command.head_command[2], -self.max_head[2])
 
+    def test_standing_and_walking_use_separate_head_ranges(self):
+        stand_head = np.array([0.02, 0.50, 1.00, 0.60])
+        mapper = PuppeteeringMapper(
+            self.cfg,
+            self.max_vel,
+            self.torso_min,
+            self.torso_max,
+            stand_head,
+            walking_max_head=self.max_head,
+        )
+
+        standing = mapper.update(self.snapshot(axes={2: 1.0, 7: -1.0}), 0.02)
+        self.assertAlmostEqual(standing.head_command[0], stand_head[0])
+        self.assertAlmostEqual(standing.head_command[2], -stand_head[2])
+
+        mapper.walk_requested = True
+        walking = mapper.update(
+            self.snapshot(axes={2: 1.0, 7: -1.0}),
+            0.02,
+            active_walking=True,
+        )
+        self.assertAlmostEqual(walking.head_command[0], self.max_head[0])
+        self.assertAlmostEqual(walking.head_command[2], -self.max_head[2])
+
     def test_triggers_map_to_lateral_walk_or_standing_roll(self):
         command = self.mapper.update(self.snapshot(buttons={8: 1}), 0.02)
         self.assertAlmostEqual(command.torso_command[3], self.torso_max[3])
         self.assertAlmostEqual(command.head_command[3], -self.torso_max[3])
 
         self.short_press_r1()
-        command = self.mapper.update(self.snapshot(buttons={9: 1}), 0.02)
-        self.assertAlmostEqual(command.walk_command[1], -self.max_vel[1] * 0.5)
+        for button, expected_vy in ((8, 0.09), (9, -0.09)):
+            with self.subTest(button=button):
+                command = self.mapper.update(self.snapshot(buttons={button: 1}), 0.02)
+                self.assertAlmostEqual(command.walk_command[1], expected_vy)
+
+        for _ in range(20):
+            command = self.mapper.update(
+                self.snapshot(buttons={7: 1, 9: 1}), 0.02
+            )
+        self.assertTrue(command.full_speed)
+        self.assertAlmostEqual(command.walk_command[1], -self.max_vel[1])
 
     def test_hold_mode_walks_only_while_r1_is_pressed(self):
         cfg = dict(self.cfg)

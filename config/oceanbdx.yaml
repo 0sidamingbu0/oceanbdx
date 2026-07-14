@@ -155,11 +155,16 @@ oceanbdx:
     # 单位分别为 [m/s^2, m/s^2, rad/s^2]。减速到零/反向时还会等待参考双支撑相位过零。
     walk_command_accel_limits: [0.50, 0.40, 1.50]
     walk_command_decel_limits: [0.40, 0.30, 1.20]
-    # 头部命令范围（与训练侧 head_command_*_range 一致；键盘微调步长见 mujoco_sim）
+    # 行走头部命令范围（与 walk cfg 一致，保留约 1/3 限幅以抑制行进时甩头）。
     max_head_dh: 0.007
     max_head_pitch: 0.17
     max_head_yaw: 0.33
     max_head_roll: 0.20
+    # 站立表现性命令使用 neck_head_map 的完整可达域；必须配套重新训练后的 StandPaper ONNX。
+    stand_max_head_dh: 0.02
+    stand_max_head_pitch: 0.50
+    stand_max_head_yaw: 1.00
+    stand_max_head_roll: 0.60
     # 站立参考完整 5^4 网格的可行命令域；最大 IK 脚位置残差 2.899mm。
     # 高度上下限不对称，不能用单个绝对 max 表示。
     torso_command_min: [-0.04, -0.17, -0.24, -0.09]
@@ -176,6 +181,9 @@ oceanbdx:
     normal_walk_gain: 0.50
     full_walk_gain: 1.00
     hold_walk_gain: 0.50         # 仅 hold 模式使用，默认保持保守半速
+    # L2/R2 是数字按键；50% * max_vy=0.075m/s 会落入策略的 0.08 零速区。
+    # 使用训练有效域内的最小横移速度，前进和转向仍严格保持 50% 普通档增益。
+    min_lateral_walk_speed: 0.09
     # 从 walking 返回 standing 后，左摇杆与 L2/R2 必须连续回中后才重新控制 torso。
     posture_rearm_duration_s: 0.15
     # 站立时右摇杆前75%把头部送到局部极限，剩余25%逐渐加入躯干转动扩展视线。

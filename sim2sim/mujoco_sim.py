@@ -825,11 +825,17 @@ class Sim:
         if np.any(self.torso_command_min >= self.torso_command_max):
             raise ValueError("command.torso_command_min must be smaller than torso_command_max")
         self.stand_base_height = float(pcfg_full.get("stand_base_height", 0.38498640060424805))
-        self.max_head = np.array([
+        self.walk_max_head = np.array([
             float(cmd_cfg.get("max_head_dh", 0.007)),
             float(cmd_cfg.get("max_head_pitch", 0.17)),
             float(cmd_cfg.get("max_head_yaw", 0.33)),
             float(cmd_cfg.get("max_head_roll", 0.20)),
+        ], dtype=np.float32)
+        self.stand_max_head = np.array([
+            float(cmd_cfg.get("stand_max_head_dh", 0.02)),
+            float(cmd_cfg.get("stand_max_head_pitch", 0.50)),
+            float(cmd_cfg.get("stand_max_head_yaw", 1.00)),
+            float(cmd_cfg.get("stand_max_head_roll", 0.60)),
         ], dtype=np.float32)
         self.puppeteering_cfg = full.get("puppeteering", {})
         self.gamepad_enabled = bool(getattr(args, "gamepad", False))
@@ -839,7 +845,8 @@ class Sim:
             self.max_vel,
             self.torso_command_min,
             self.torso_command_max,
-            self.max_head,
+            self.stand_max_head,
+            walking_max_head=self.walk_max_head,
         )
         self._puppeteer_walk_requested = False
         self._puppeteer_connected = False
@@ -1332,12 +1339,22 @@ class Sim:
             return
         self._cmd_key(chr(keycode).lower())
 
+    def _active_head_limits(self):
+        """Return head-command limits for the policy that is currently running."""
+        return self.walk_max_head if self.state == "RL_WALK" else self.stand_max_head
+
+    def _active_policy_head_command(self):
+        """Bound persistent commands before they enter the active policy observation."""
+        limits = self._active_head_limits()
+        return np.clip(self.head_cmd, -limits, limits)
+
     def _cmd_key(self, c):
         """处理单个按键字符 (已转小写)。窗口回调与终端线程共用。
 
         与真机 src/main.cpp 一致: 0/1/2/3=状态 9=阻尼 r=重置 p=电机开关
         w/s=vx± a/d=vy± q/e=wz± x=速度清零
         """
+        head_limits = self._active_head_limits()
         if c == "0":
             self.start_real_sit_align()
         elif c == "p":
@@ -1403,21 +1420,21 @@ class Sim:
         # ---- 头部命令（RL_BALANCE / RL_WALK 均生效，脖子随时可动）----
         # i/k=点头pitch± j/l=摇头yaw± u/o=歪头roll± n/m=头高± h=头命令清零
         elif c == "i":
-            self.head_cmd[1] = min(self.head_cmd[1] + 0.1, self.max_head[1])
+            self.head_cmd[1] = min(self.head_cmd[1] + 0.1, head_limits[1])
         elif c == "k":
-            self.head_cmd[1] = max(self.head_cmd[1] - 0.1, -self.max_head[1])
+            self.head_cmd[1] = max(self.head_cmd[1] - 0.1, -head_limits[1])
         elif c == "j":
-            self.head_cmd[2] = min(self.head_cmd[2] + 0.1, self.max_head[2])
+            self.head_cmd[2] = min(self.head_cmd[2] + 0.1, head_limits[2])
         elif c == "l":
-            self.head_cmd[2] = max(self.head_cmd[2] - 0.1, -self.max_head[2])
+            self.head_cmd[2] = max(self.head_cmd[2] - 0.1, -head_limits[2])
         elif c == "u":
-            self.head_cmd[3] = min(self.head_cmd[3] + 0.1, self.max_head[3])
+            self.head_cmd[3] = min(self.head_cmd[3] + 0.1, head_limits[3])
         elif c == "o":
-            self.head_cmd[3] = max(self.head_cmd[3] - 0.1, -self.max_head[3])
+            self.head_cmd[3] = max(self.head_cmd[3] - 0.1, -head_limits[3])
         elif c == "n":
-            self.head_cmd[0] = min(self.head_cmd[0] + 0.005, self.max_head[0])
+            self.head_cmd[0] = min(self.head_cmd[0] + 0.005, head_limits[0])
         elif c == "m":
-            self.head_cmd[0] = max(self.head_cmd[0] - 0.005, -self.max_head[0])
+            self.head_cmd[0] = max(self.head_cmd[0] - 0.005, -head_limits[0])
         elif c == "h":
             self.head_cmd[:] = 0.0
         # ---- 站立躯干命令（仅 RL_STAND 生效，微调站姿）----
@@ -1626,6 +1643,7 @@ class Sim:
 
         reversing = current * target < 0.0
         reducing_magnitude = np.abs(target) < np.abs(current)
+        approaching_zero = bool(np.any(reversing | reducing_magnitude))
         rate_limits = np.where(
             reversing | reducing_magnitude,
             self.walk_command_decel_limits,
@@ -1642,6 +1660,7 @@ class Sim:
         if (
             not self._walk_command_safe_zero_active
             and was_moving
+            and approaching_zero
             and candidate_peak < self.switch_min_moving_command
         ):
             if self._phase_in_switch_window():
@@ -2313,9 +2332,13 @@ class Sim:
                     pos_pf, yaw_pf = self.path_frame.base_in_path_frame(base_xy, head_yaw)
                     neck_q = self.data.qpos[self.neck_q_adr].copy()
                     neck_dq = self.data.qvel[self.neck_v_adr].copy()
+                    # Keyboard commands persist across policy switches. Clamp again at the
+                    # inference boundary so the walking policy never receives a standing-only
+                    # head command outside its training distribution.
+                    policy_head_cmd = self._active_policy_head_command()
                     next_target, next_neck_target = self.policy.step(
                         q, dq, gyro, quat_rotate_inverse_gravity(quat), cmd, pos_pf, yaw_pf, lin_vel_b,
-                        neck_q, neck_dq, self.head_cmd, torso_cmd,
+                        neck_q, neck_dq, policy_head_cmd, torso_cmd,
                     )
                     max_setpoint_deviation = self.motor_tau_max / np.maximum(self.kp, 1.0e-6)
                     next_target = np.clip(next_target, q - max_setpoint_deviation, q + max_setpoint_deviation)

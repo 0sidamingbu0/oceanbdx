@@ -135,12 +135,26 @@ class PuppeteeringMapper:
     deployments that should walk only while R1 remains pressed.
     """
 
-    def __init__(self, cfg: dict, max_velocity, torso_min, torso_max, max_head):
+    def __init__(
+        self,
+        cfg: dict,
+        max_velocity,
+        torso_min,
+        torso_max,
+        max_head,
+        walking_max_head=None,
+    ):
         self.cfg = cfg
         self.max_velocity = np.asarray(max_velocity, dtype=np.float32)
         self.torso_min = np.asarray(torso_min, dtype=np.float32)
         self.torso_max = np.asarray(torso_max, dtype=np.float32)
         self.max_head = np.asarray(max_head, dtype=np.float32)
+        self.walking_max_head = np.asarray(
+            max_head if walking_max_head is None else walking_max_head,
+            dtype=np.float32,
+        )
+        if self.max_head.shape != (4,) or self.walking_max_head.shape != (4,):
+            raise ValueError("standing and walking head limits must each contain four values")
 
         self.deadzone = float(cfg.get("axis_deadzone", 0.08))
         self.walk_button_behavior = str(cfg.get("walk_button_behavior", "toggle")).lower()
@@ -150,6 +164,9 @@ class PuppeteeringMapper:
         self.normal_walk_gain = float(cfg.get("normal_walk_gain", 0.5))
         self.full_walk_gain = float(cfg.get("full_walk_gain", 1.0))
         self.hold_walk_gain = float(cfg.get("hold_walk_gain", self.normal_walk_gain))
+        self.min_lateral_walk_speed = float(
+            cfg.get("min_lateral_walk_speed", 0.0)
+        )
         self.posture_rearm_duration = max(
             0.0, float(cfg.get("posture_rearm_duration_s", 0.15))
         )
@@ -160,6 +177,10 @@ class PuppeteeringMapper:
             raise ValueError("puppeteering.gaze_torso_threshold must be in [0, 1)")
         if min(self.normal_walk_gain, self.full_walk_gain, self.hold_walk_gain) < 0.0:
             raise ValueError("puppeteering walk gains must be non-negative")
+        if not 0.0 <= self.min_lateral_walk_speed <= float(self.max_velocity[1]):
+            raise ValueError(
+                "puppeteering.min_lateral_walk_speed must be within [0, max_vy]"
+            )
 
         mapping = cfg.get("mapping", {})
         self.axis_left_x = int(mapping.get("axis_left_x", 0))
@@ -179,6 +200,7 @@ class PuppeteeringMapper:
         self._r1_press_elapsed = 0.0
         self._r1_long_press = False
         self._r1_gesture_cancelled = False
+        self._r1_started_walk = False
         self._stand_was_pressed = False
         self._start_was_pressed = False
         self._posture_inputs_armed = False
@@ -190,6 +212,7 @@ class PuppeteeringMapper:
         self._r1_press_elapsed = 0.0
         self._r1_long_press = False
         self._r1_gesture_cancelled = False
+        self._r1_started_walk = False
         self._stand_was_pressed = False
         self._start_was_pressed = False
         self._posture_inputs_armed = False
@@ -237,6 +260,7 @@ class PuppeteeringMapper:
         if self.walk_button_behavior == "hold":
             if r1_pressed and not self._r1_was_pressed:
                 self._r1_gesture_cancelled = stand_pressed
+                self._r1_started_walk = False
             if not r1_pressed:
                 self._r1_gesture_cancelled = False
             self.walk_requested = r1_pressed and not self._r1_gesture_cancelled
@@ -248,6 +272,13 @@ class PuppeteeringMapper:
                 self._r1_press_elapsed = 0.0
                 self._r1_long_press = False
                 self._r1_gesture_cancelled = stand_pressed
+                # Starting to walk is unambiguous while standing, so consume the
+                # press edge immediately. This preserves a stick command that is
+                # already active when R1 is pressed. While walking, the release edge
+                # still distinguishes a short stop press from a full-speed hold.
+                self._r1_started_walk = not self.walk_requested and not stand_pressed
+                if self._r1_started_walk:
+                    self.walk_requested = True
             if r1_pressed:
                 self._r1_press_elapsed += dt
                 if self._r1_press_elapsed >= self.r1_hold_duration:
@@ -257,10 +288,12 @@ class PuppeteeringMapper:
                     not self._r1_long_press
                     and not self._r1_gesture_cancelled
                     and not stand_pressed
+                    and not self._r1_started_walk
                 ):
                     self.walk_requested = not self.walk_requested
                 self._r1_press_elapsed = 0.0
                 self._r1_gesture_cancelled = False
+                self._r1_started_walk = False
             full_speed = (
                 r1_pressed
                 and self._r1_long_press
@@ -323,10 +356,11 @@ class PuppeteeringMapper:
         controls_are_walking = (
             self.walk_requested if active_walking is None else bool(active_walking)
         )
+        head_limits = self.walking_max_head if controls_are_walking else self.max_head
 
         head = np.zeros(4, dtype=np.float32)
-        head[0] = dpad_up * self.max_head[0]
-        head[3] = -dpad_x * self.max_head[3]
+        head[0] = dpad_up * head_limits[0]
+        head[3] = -dpad_x * head_limits[3]
         torso = np.zeros(4, dtype=np.float32)
         walk = np.zeros(3, dtype=np.float32)
 
@@ -338,8 +372,8 @@ class PuppeteeringMapper:
             # after the walking policy has actually exited.
             self._posture_inputs_armed = False
             self._posture_neutral_elapsed = 0.0
-            head[1] = gaze_pitch * self.max_head[1]
-            head[2] = gaze_yaw * self.max_head[2]
+            head[1] = gaze_pitch * head_limits[1]
+            head[2] = gaze_yaw * head_limits[2]
         else:
             head_gaze_pitch, torso_gaze_pitch = self._standing_gaze(gaze_pitch)
             head_gaze_yaw, torso_gaze_yaw = self._standing_gaze(gaze_yaw)
@@ -389,8 +423,8 @@ class PuppeteeringMapper:
             posture_roll = self._signed_range(
                 posture_l2 - posture_r2, self.torso_min[3], self.torso_max[3]
             )
-            head[1] = head_gaze_pitch * self.max_head[1] - posture_pitch
-            head[2] = head_gaze_yaw * self.max_head[2] - posture_yaw
+            head[1] = head_gaze_pitch * head_limits[1] - posture_pitch
+            head[2] = head_gaze_yaw * head_limits[2] - posture_yaw
             head[3] -= posture_roll
 
         if self.walk_requested:
@@ -400,10 +434,14 @@ class PuppeteeringMapper:
                 else self.full_walk_gain if full_speed else self.normal_walk_gain
             )
             walk[0] = left_up * self.max_velocity[0] * gain
-            walk[1] = (l2 - r2) * self.max_velocity[1] * gain
+            lateral_input = l2 - r2
+            lateral_speed = self.max_velocity[1] * gain
+            if lateral_input != 0.0 and gain > 0.0:
+                lateral_speed = max(lateral_speed, self.min_lateral_walk_speed)
+            walk[1] = lateral_input * lateral_speed
             walk[2] = -left_x * self.max_velocity[2] * gain
 
-        head[:] = np.clip(head, -self.max_head, self.max_head)
+        head[:] = np.clip(head, -head_limits, head_limits)
         walk[:] = np.clip(walk, -self.max_velocity, self.max_velocity)
         return PuppeteeringCommand(
             walk_requested=self.walk_requested,
