@@ -223,6 +223,123 @@ class WalkStandSwitchTest(unittest.TestCase):
             self.sim.walk_command_accel_limits[0] * self.sim.control_dt + 1.0e-12,
         )
 
+    def test_viewer_push_keys_apply_both_directions_and_preserve_mouse_force(self):
+        self.set_stand()
+        self.sim.viewer_push_force[:] = [12.0, -34.0, 5.0]
+        self.sim.viewer_push_duration = 0.1
+        body_id = self.sim.viewer_push_base_body_id
+        baseline = np.array([1.0, 2.0, 3.0, 0.4, 0.5, 0.6])
+        self.sim.data.xfrc_applied[body_id] = baseline
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._cmd_key("5")
+            self.sim._consume_viewer_push_requests()
+        self.sim.data.qfrc_applied[:] = 0.0
+        applied = self.sim._begin_viewer_push_substep()
+        self.sim._apply_viewer_push_substep(applied)
+        np.testing.assert_allclose(
+            self.sim.data.qfrc_applied[:3], self.sim.viewer_push_force
+        )
+        self.sim._end_viewer_push_substep(applied)
+        np.testing.assert_allclose(self.sim.data.xfrc_applied[body_id], baseline)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim._cmd_key("5")
+            self.sim._cmd_key("6")
+            self.sim._consume_viewer_push_requests()
+        self.sim.data.qfrc_applied[:] = 0.0
+        applied = self.sim._begin_viewer_push_substep()
+        self.sim._apply_viewer_push_substep(applied)
+        np.testing.assert_allclose(
+            self.sim.data.qfrc_applied[:3], -self.sim.viewer_push_force
+        )
+        self.sim._end_viewer_push_substep(applied)
+        np.testing.assert_allclose(self.sim.data.xfrc_applied[body_id], baseline)
+
+    def test_viewer_push_duration_and_safety_guards(self):
+        self.set_stand()
+        self.sim.viewer_push_force[:] = [0.0, 60.0, 0.0]
+        timestep = float(self.sim.model.opt.timestep)
+        self.sim.viewer_push_duration = 2.5 * timestep
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertTrue(self.sim._trigger_viewer_push())
+            substeps = 0
+            while True:
+                applied = self.sim._begin_viewer_push_substep()
+                if applied is None:
+                    break
+                self.sim._end_viewer_push_substep(applied)
+                substeps += 1
+        self.assertEqual(substeps, 3)
+        self.assertEqual(output.getvalue().count("[viewer_push] complete"), 1)
+        self.assertEqual(self.sim._viewer_push_remaining, 0.0)
+
+        self.sim.state = "SIT"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.sim._trigger_viewer_push())
+        self.set_stand()
+        self.sim.want_real = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.sim._trigger_viewer_push())
+        self.assertEqual(self.sim._viewer_push_remaining, 0.0)
+
+    def test_viewer_push_configuration_validation_and_reset(self):
+        base_args = dict(
+            config=os.path.join(ms.ROOT, "config/oceanbdx.yaml"),
+            policy=None,
+            stand_policy=None,
+            no_policy=True,
+            real=False,
+            manual=False,
+            no_log=True,
+            sim_rl_kd=None,
+            sim_rl_kd_list=None,
+            sim_action_scale=None,
+        )
+        args = SimpleNamespace(
+            **base_args,
+            viewer_push_force_x=11.0,
+            viewer_push_force_y=-22.0,
+            viewer_push_force_z=3.0,
+            viewer_push_duration=0.125,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            sim = ms.Sim(args)
+        np.testing.assert_allclose(sim.viewer_push_force, [11.0, -22.0, 3.0])
+        self.assertEqual(sim.viewer_push_duration, 0.125)
+        self.assertEqual(sim.viewer_push_base_body_id, sim.model.body("base_link").id)
+
+        sim.state = "RL_STAND"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(sim._trigger_viewer_push())
+            sim._request_viewer_push(-1.0)
+            sim.reset()
+            sim._consume_viewer_push_requests()
+        self.assertEqual(sim._viewer_push_remaining, 0.0)
+
+        invalid_cases = (
+            {"viewer_push_force_x": float("nan")},
+            {"viewer_push_force_z": float("inf")},
+            {"viewer_push_duration": 0.0},
+            {"viewer_push_duration": -0.1},
+            {"viewer_push_duration": float("nan")},
+        )
+        for override in invalid_cases:
+            invalid_args = dict(base_args)
+            invalid_args.update(
+                viewer_push_force_x=0.0,
+                viewer_push_force_y=0.0,
+                viewer_push_force_z=0.0,
+                viewer_push_duration=0.1,
+            )
+            invalid_args.update(override)
+            with self.subTest(override=override):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(ValueError):
+                        ms.Sim(SimpleNamespace(**invalid_args))
+
     def test_persistent_head_command_is_clipped_for_active_policy(self):
         self.sim.head_cmd[:] = self.sim.stand_max_head
         self.sim.state = "RL_WALK"
@@ -390,6 +507,32 @@ class WalkStandSwitchTest(unittest.TestCase):
             heights.append(float(self.sim._effective_torso_cmd[0]))
         self.assertTrue(np.all(np.diff(heights) >= -1.0e-12))
         self.assertAlmostEqual(heights[-1], 0.0)
+        self.assertEqual(self.sim.state, "RL_STAND")
+
+    def test_stand_to_walk_head_command_ramps_to_neutral(self):
+        self.set_stand()
+        self.sim.head_cmd[:] = self.sim.stand_max_head
+        start = self.sim.head_cmd.copy()
+        self.request("RL_WALK")
+        self.update()
+
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertEqual(self.sim._stand_to_walk_stage, "RECENTER")
+        np.testing.assert_allclose(self.sim.head_cmd, 0.0)
+        self.assertGreater(
+            np.min(self.sim._active_policy_head_command() / start), 0.9
+        )
+        self.assertAlmostEqual(
+            self.sim._stand_to_walk_recenter_duration,
+            self.sim.stand_to_walk_recenter_max_duration,
+        )
+
+        peaks = [float(np.max(np.abs(self.sim._active_policy_head_command())))]
+        while self.sim._stand_to_walk_stage == "RECENTER":
+            self.update()
+            peaks.append(float(np.max(np.abs(self.sim._active_policy_head_command()))))
+        self.assertTrue(np.all(np.diff(peaks) <= 1.0e-12))
+        self.assertAlmostEqual(peaks[-1], 0.0)
         self.assertEqual(self.sim.state, "RL_STAND")
 
     def test_stand_to_walk_recenter_duration_scales_with_command(self):
@@ -628,6 +771,35 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.gamepad_update(full_forward_released)
         expected_step = self.sim.walk_command_accel_limits[0] * self.sim.control_dt
         self.assertAlmostEqual(self.sim._effective_walk_cmd[0], expected_step)
+
+    def test_gamepad_head_input_cannot_override_stand_recenter(self):
+        self.set_stand()
+        self.sim.gamepad_enabled = True
+        look_and_toggle = self.gamepad_snapshot(axes={3: -1.0}, buttons={7: 1})
+        look_held = self.gamepad_snapshot(axes={3: -1.0})
+
+        self.gamepad_update(look_held)
+        self.assertAlmostEqual(self.sim.head_cmd[1], self.sim.stand_max_head[1])
+        self.gamepad_update(look_and_toggle)
+        self.assertEqual(self.sim.state, "RL_STAND")
+        self.assertEqual(self.sim._stand_to_walk_stage, "RECENTER")
+        self.assertGreater(self.sim._active_policy_head_command()[1], 0.0)
+        np.testing.assert_allclose(self.sim.head_cmd, 0.0)
+
+        previous = self.sim._active_policy_head_command().copy()
+        for _ in range(1000):
+            if self.sim.state == "RL_WALK":
+                break
+            self.gamepad_update(look_held)
+            current = self.sim._active_policy_head_command().copy()
+            self.assertLessEqual(np.max(np.abs(current)), np.max(np.abs(previous)) + 1.0e-12)
+            np.testing.assert_allclose(self.sim.head_cmd, 0.0)
+            previous = current
+
+        self.assertEqual(self.sim.state, "RL_WALK")
+        np.testing.assert_allclose(self.sim.head_cmd, 0.0)
+        self.gamepad_update(look_held)
+        self.assertAlmostEqual(self.sim.head_cmd[1], self.sim.walk_max_head[1])
 
     def test_gamepad_release_requires_posture_inputs_to_return_neutral(self):
         self.sim.puppeteer.posture_rearm_duration = 3 * self.sim.control_dt

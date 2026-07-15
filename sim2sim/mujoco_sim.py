@@ -14,6 +14,7 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 用法 (在 oceanbdx 根目录):
     python3 sim2sim/mujoco_sim.py [--policy policy/policy.onnx] [--config config/oceanbdx.yaml]
     python3 sim2sim/mujoco_sim.py --gamepad       # 使用论文附录 C 的 R1/双摇杆映射
+    python3 sim2sim/mujoco_sim.py --viewer-push-force-y 60 --viewer-push-duration 0.1
     python3 sim2sim/mujoco_sim.py --no-policy     # 无策略, 只验证起立脚本与RL接管状态机
     python3 sim2sim/mujoco_sim.py --manual        # 纯sim: 拖动滑块摆关节角
     python3 sim2sim/mujoco_sim.py --real --no-policy # 仿真目标角→真机, 面板显示真机误差
@@ -24,6 +25,7 @@ OceanBDX sim2sim: MuJoCo + ONNX policy 验证
 
 键盘 (★推荐聚焦“终端窗口”操作, 与真机 main.cpp 一致, 不触发 MuJoCo 快捷键):
     0 = 真机缓慢到蹲姿   1 = 起立/切站立模型   2 = 切行走模型   3 = 切站立模型(同1)   9 = 阻尼   r = 重置
+    5/6 = viewer 配置推力正向/反向 (仅仿真, 在终端短按)
     p = 真机电机输出开关
     w/s = vx±0.1   a/d = vy±0.1   q/e = wz±0.1   x = 速度清零
     (未启用 --gamepad 时，速度指令仅在 RL_WALK 行走模型生效，先按 2 进入行走)
@@ -882,6 +884,8 @@ class Sim:
         self._stand_to_walk_stable_elapsed = 0.0
         self._stand_to_walk_recenter_duration = 0.0
         self._stand_to_walk_start_torso_cmd = np.zeros(4, dtype=np.float32)
+        self._stand_to_walk_start_head_cmd = np.zeros(4, dtype=np.float32)
+        self._stand_to_walk_effective_head_cmd = np.zeros(4, dtype=np.float32)
         self._stand_to_walk_block_reason = "idle"
         self._stand_to_walk_cancelled = False
         self._stand_to_walk_source = None
@@ -922,6 +926,20 @@ class Sim:
         self.debug_push_policy_step = 0
         self.debug_push_base_body_id = self.model.body("base_link").id
         self.debug_push_foot_geom_ids = [self.model.geom("foot_r").id, self.model.geom("foot_l").id]
+        self.viewer_push_force = np.array([
+            float(getattr(args, "viewer_push_force_x", 0.0)),
+            float(getattr(args, "viewer_push_force_y", 0.0)),
+            float(getattr(args, "viewer_push_force_z", 0.0)),
+        ], dtype=float)
+        self.viewer_push_duration = float(getattr(args, "viewer_push_duration", 0.1))
+        if not np.all(np.isfinite(self.viewer_push_force)):
+            raise ValueError("viewer push force must contain only finite values")
+        if not np.isfinite(self.viewer_push_duration) or self.viewer_push_duration <= 0.0:
+            raise ValueError("viewer push duration must be finite and greater than zero")
+        self._viewer_push_remaining = 0.0
+        self._viewer_push_sign = 1.0
+        self._viewer_push_requests = queue.SimpleQueue()
+        self.viewer_push_base_body_id = self.model.body("base_link").id
 
         # 虚拟坐凳 (复刻真机底座): 坐姿时支撑躯干, 起立完成后下沉移除
         self.stool_gid = self.model.geom("stool").id
@@ -999,6 +1017,8 @@ class Sim:
         self._stand_to_walk_stable_elapsed = 0.0
         self._stand_to_walk_recenter_duration = 0.0
         self._stand_to_walk_start_torso_cmd[:] = 0.0
+        self._stand_to_walk_start_head_cmd[:] = 0.0
+        self._stand_to_walk_effective_head_cmd[:] = 0.0
         self._stand_to_walk_block_reason = "idle"
         self._stand_to_walk_cancelled = False
         self._stand_to_walk_source = None
@@ -1019,6 +1039,8 @@ class Sim:
         self._rl_gain_blend_start_neck_target = self.neck_default.copy()
         self._rl_gain_blend_start_torso_command[:] = 0.0
         self._rl_gain_blend_target_torso_command[:] = 0.0
+        self._viewer_push_remaining = 0.0
+        self._viewer_push_requests = queue.SimpleQueue()
         self.cmd[:] = 0
         self.rl_target = self.stand_pose.copy()
         self.policy_target_prev = self.stand_pose.copy()
@@ -1318,6 +1340,77 @@ class Sim:
                 f"final_sat={final['sat_count']}/{self.nj}"
             )
 
+    def _trigger_viewer_push(self, sign=1.0):
+        """Start a repeatable viewer push on the main control thread."""
+        if self.want_real:
+            print("[viewer_push] disabled while --real is active")
+            return False
+        if self.state not in ("RL_STAND", "RL_WALK"):
+            print(f"[viewer_push] ignored in {self.state}; enter RL_STAND or RL_WALK first")
+            return False
+        if np.linalg.norm(self.viewer_push_force) <= 1.0e-12:
+            print("[viewer_push] force is zero; set --viewer-push-force-x/y/z")
+            return False
+        self._viewer_push_sign = 1.0 if sign >= 0.0 else -1.0
+        self._viewer_push_remaining = self.viewer_push_duration
+        force = self._viewer_push_sign * self.viewer_push_force
+        print(
+            "[viewer_push] start "
+            f"state={self.state} force_w={np.round(force, 3).tolist()}N "
+            f"duration={self.viewer_push_duration:.3f}s"
+        )
+        return True
+
+    def _request_viewer_push(self, sign=1.0):
+        """Queue a key-thread request; the control thread validates and starts it."""
+        self._viewer_push_requests.put(1.0 if sign >= 0.0 else -1.0)
+
+    def _consume_viewer_push_requests(self):
+        """Drain queued key events at a control boundary, with the newest direction winning."""
+        requested_sign = None
+        while True:
+            try:
+                requested_sign = self._viewer_push_requests.get_nowait()
+            except queue.Empty:
+                break
+        if requested_sign is not None:
+            self._trigger_viewer_push(requested_sign)
+
+    def _begin_viewer_push_substep(self):
+        """Return the configured force for one physics substep, or cancel outside RL."""
+        if self._viewer_push_remaining <= 0.0:
+            return None
+        if self.state not in ("RL_STAND", "RL_WALK"):
+            self._viewer_push_remaining = 0.0
+            print(f"[viewer_push] cancelled in {self.state}")
+            return None
+        return (self._viewer_push_sign * self.viewer_push_force).copy()
+
+    def _apply_viewer_push_substep(self, applied_force):
+        """Map a world-frame force at the base CoM into generalized force."""
+        if applied_force is None:
+            return
+        mujoco.mj_applyFT(
+            self.model,
+            self.data,
+            applied_force,
+            np.zeros(3),
+            self.data.xipos[self.viewer_push_base_body_id],
+            self.viewer_push_base_body_id,
+            self.data.qfrc_applied,
+        )
+
+    def _end_viewer_push_substep(self, applied_force):
+        """Advance the scripted-force timer after one completed physics substep."""
+        if applied_force is None:
+            return
+        was_active = self._viewer_push_remaining > 0.0
+        self._viewer_push_remaining = max(
+            0.0, self._viewer_push_remaining - float(self.model.opt.timestep)
+        )
+        if was_active and self._viewer_push_remaining <= 0.0:
+            print("[viewer_push] complete")
+
     def key_cb(self, keycode):
         """MuJoCo viewer 窗口内的按键回调。
 
@@ -1346,12 +1439,16 @@ class Sim:
     def _active_policy_head_command(self):
         """Bound persistent commands before they enter the active policy observation."""
         limits = self._active_head_limits()
-        return np.clip(self.head_cmd, -limits, limits)
+        command = self.head_cmd
+        if self.state == "RL_STAND" and self._stand_to_walk_stage is not None:
+            command = self._stand_to_walk_effective_head_cmd
+        return np.clip(command, -limits, limits)
 
     def _cmd_key(self, c):
         """处理单个按键字符 (已转小写)。窗口回调与终端线程共用。
 
         与真机 src/main.cpp 一致: 0/1/2/3=状态 9=阻尼 r=重置 p=电机开关
+        5/6=viewer 配置推力正向/反向（仅仿真）
         w/s=vx± a/d=vy± q/e=wz± x=速度清零
         """
         head_limits = self._active_head_limits()
@@ -1389,6 +1486,10 @@ class Sim:
             # 兼容旧键位: 回站立模型 (= 按 1)
             if self.state in ("RL_STAND", "RL_WALK"):
                 self._switch_rl_state("RL_STAND")
+        elif c == "5":
+            self._request_viewer_push(+1.0)
+        elif c == "6":
+            self._request_viewer_push(-1.0)
         elif c == "9":
             self.state = "DAMPING"
             self._rl_switch_requests = queue.SimpleQueue()
@@ -1419,6 +1520,9 @@ class Sim:
             self.cmd[2] = max(self.cmd[2] - 0.1, -self.max_vel[2])
         # ---- 头部命令（RL_BALANCE / RL_WALK 均生效，脖子随时可动）----
         # i/k=点头pitch± j/l=摇头yaw± u/o=歪头roll± n/m=头高± h=头命令清零
+        elif c in "ikjluonmh" and self._stand_to_walk_stage is not None:
+            print("[FSM] stand->walk 回正中，暂不接受新的 head 命令")
+            return
         elif c == "i":
             self.head_cmd[1] = min(self.head_cmd[1] + 0.1, head_limits[1])
         elif c == "k":
@@ -1494,7 +1598,15 @@ class Sim:
             self._puppeteer_blocked_target = None
         if mapped.start_requested and self.state == "SIT":
             self._cmd_key("1")
-        self.head_cmd[:] = mapped.head_command
+        if self.state == "RL_STAND" and self._stand_to_walk_stage is not None:
+            self.head_cmd[:] = 0.0
+        elif self.state == "RL_STAND" and mapped.walk_requested:
+            # R1 changes the left stick from standing posture to walking velocity. Preserve
+            # the head pose that was actually active before this remapping frame; otherwise
+            # the standing counter-gaze term creates a spurious head recenter request.
+            pass
+        else:
+            self.head_cmd[:] = mapped.head_command
         if mapped.walk_requested:
             self.cmd[:] = mapped.walk_command
             self.torso_cmd[:] = 0.0
@@ -1615,6 +1727,8 @@ class Sim:
         self._stand_to_walk_stable_elapsed = 0.0
         self._stand_to_walk_recenter_duration = 0.0
         self._stand_to_walk_start_torso_cmd[:] = 0.0
+        self._stand_to_walk_start_head_cmd[:] = 0.0
+        self._stand_to_walk_effective_head_cmd[:] = 0.0
         self._stand_to_walk_block_reason = "idle"
         self._stand_to_walk_cancelled = False
         self._stand_to_walk_source = None
@@ -1712,15 +1826,22 @@ class Sim:
 
     def _start_stand_recenter(self):
         self._stand_to_walk_start_torso_cmd[:] = self._effective_torso_cmd
-        command_extent = np.maximum(
+        torso_extent = np.maximum(
             np.abs(self.torso_command_min), np.abs(self.torso_command_max)
         )
-        normalized_offset = float(
+        torso_offset = float(
             np.max(
                 np.abs(self._stand_to_walk_start_torso_cmd)
-                / np.maximum(command_extent, 1.0e-6)
+                / np.maximum(torso_extent, 1.0e-6)
             )
         )
+        head_offset = float(
+            np.max(
+                np.abs(self._stand_to_walk_start_head_cmd)
+                / np.maximum(self.stand_max_head, 1.0e-6)
+            )
+        )
+        normalized_offset = max(torso_offset, head_offset)
         self._stand_to_walk_recenter_duration = (
             self.stand_to_walk_recenter_max_duration * min(1.0, normalized_offset)
         )
@@ -1728,16 +1849,18 @@ class Sim:
         self._stand_to_walk_stable_elapsed = 0.0
         if self._stand_to_walk_recenter_duration <= self.control_dt:
             self._effective_torso_cmd[:] = 0.0
+            self._stand_to_walk_effective_head_cmd[:] = 0.0
             self._stand_to_walk_stage = "ZERO_HOLD"
             self._stand_to_walk_block_reason = "minimum neutral-command hold"
             print("[FSM] RL_STAND -> STAND_NEUTRAL_HOLD (already neutral)")
         else:
             self._stand_to_walk_stage = "RECENTER"
-            self._stand_to_walk_block_reason = "recentering torso command"
+            self._stand_to_walk_block_reason = "recentering torso/head command"
             print(
                 "[FSM] RL_STAND -> STAND_RECENTER "
                 f"duration={self._stand_to_walk_recenter_duration:.2f}s "
-                f"cmd={np.round(self._stand_to_walk_start_torso_cmd, 3).tolist()}"
+                f"torso={np.round(self._stand_to_walk_start_torso_cmd, 3).tolist()} "
+                f"head={np.round(self._stand_to_walk_start_head_cmd, 3).tolist()}"
             )
 
     def _begin_stand_to_walk(
@@ -1754,8 +1877,13 @@ class Sim:
         if not preserve_walk_command:
             self.cmd[:] = 0.0
         self._effective_walk_cmd[:] = 0.0
-        # Clear the user target immediately, but keep the command applied to the standing
-        # policy continuous. _start_stand_recenter() ramps that effective command to zero.
+        # Clear user targets immediately, while keeping the commands applied to the standing
+        # policy continuous. _start_stand_recenter() ramps both effective commands to zero.
+        self._stand_to_walk_start_head_cmd[:] = np.clip(
+            self.head_cmd, -self.stand_max_head, self.stand_max_head
+        )
+        self._stand_to_walk_effective_head_cmd[:] = self._stand_to_walk_start_head_cmd
+        self.head_cmd[:] = 0.0
         self.torso_cmd[:] = 0.0
         self._stand_to_walk_total_elapsed = 0.0
         self._stand_to_walk_stage_elapsed = 0.0
@@ -1778,10 +1906,12 @@ class Sim:
         self.pending_rl_state = None
         self.cmd[:] = 0.0
         self._effective_walk_cmd[:] = 0.0
+        self.head_cmd[:] = 0.0
         self.torso_cmd[:] = 0.0
         self._stand_to_walk_cancelled = True
         if stage == "ZERO_HOLD":
             self._effective_torso_cmd[:] = 0.0
+            self._stand_to_walk_effective_head_cmd[:] = 0.0
             self._clear_stand_to_walk_transition()
         if source == "gamepad":
             self._puppeteer_blocked_target = None
@@ -1858,6 +1988,7 @@ class Sim:
             if not preserve_walk_command:
                 self.cmd[:] = 0.0
             self._effective_walk_cmd[:] = 0.0
+            self.head_cmd[:] = 0.0
             self.torso_cmd[:] = 0.0
             if source == "gamepad":
                 self._puppeteer_blocked_target = "RL_WALK"
@@ -1868,6 +1999,7 @@ class Sim:
                 self._stand_to_walk_total_elapsed = 0.0
             else:
                 self._effective_torso_cmd[:] = 0.0
+                self._stand_to_walk_effective_head_cmd[:] = 0.0
                 self._clear_stand_to_walk_transition()
             print(
                 "[FSM] stand->walk timeout after "
@@ -1891,8 +2023,12 @@ class Sim:
             self._effective_torso_cmd[:] = (
                 self._stand_to_walk_start_torso_cmd * (1.0 - blend)
             )
+            self._stand_to_walk_effective_head_cmd[:] = (
+                self._stand_to_walk_start_head_cmd * (1.0 - blend)
+            )
             if progress >= 1.0:
                 self._effective_torso_cmd[:] = 0.0
+                self._stand_to_walk_effective_head_cmd[:] = 0.0
                 if self._stand_to_walk_cancelled:
                     self._clear_stand_to_walk_transition()
                     print("[FSM] stand->walk cancellation reached neutral; remain RL_STAND")
@@ -1908,6 +2044,7 @@ class Sim:
             return
 
         self._effective_torso_cmd[:] = 0.0
+        self._stand_to_walk_effective_head_cmd[:] = 0.0
         if self._stand_to_walk_cancelled:
             self._clear_stand_to_walk_transition()
             return
@@ -2036,6 +2173,7 @@ class Sim:
             else:
                 self.cmd[:] = 0.0
             self._effective_walk_cmd[:] = 0.0
+            self.head_cmd[:] = 0.0
             self.torso_cmd[:] = 0.0
             self._effective_torso_cmd[:] = 0.0
             label = "walk model"
@@ -2574,6 +2712,13 @@ class Sim:
         sim_steps_per_ctrl = max(1, int(round(self.control_dt / self.model.opt.timestep)))
         print(f"[sim2sim] sim_dt={self.model.opt.timestep} control_dt={self.control_dt} "
               f"({sim_steps_per_ctrl} substeps), policy {'ON' if self.policy else 'OFF'}")
+        if np.linalg.norm(self.viewer_push_force) > 1.0e-12:
+            print(
+                "[viewer_push] configured "
+                f"force_w={np.round(self.viewer_push_force, 3).tolist()}N "
+                f"duration={self.viewer_push_duration:.3f}s; "
+                "press terminal 5 for this direction, 6 for the opposite direction"
+            )
         print(__doc__)
 
         if self.gamepad_enabled:
@@ -2620,12 +2765,19 @@ class Sim:
                 geomgroup0 = np.array(v.opt.geomgroup).copy()
                 while v.is_running() and (self.real_panel is None or self.real_panel.alive()):
                     t0 = time.time()
+                    self._consume_viewer_push_requests()
                     tau, neck_tau = self.control_step()
                     self.update_real_output()
                     for _ in range(sim_steps_per_ctrl):
+                        self.data.qfrc_applied[:] = 0.0
                         self.data.qfrc_applied[self.v_adr] = tau
                         self.data.qfrc_applied[self.neck_v_adr] = neck_tau
-                        mujoco.mj_step(self.model, self.data)
+                        applied_viewer_force = self._begin_viewer_push_substep()
+                        self._apply_viewer_push_substep(applied_viewer_force)
+                        try:
+                            mujoco.mj_step(self.model, self.data)
+                        finally:
+                            self._end_viewer_push_substep(applied_viewer_force)
                     v.opt.geomgroup[:] = geomgroup0
                     v.sync()
                     dt_left = self.control_dt - (time.time() - t0)
@@ -2672,15 +2824,23 @@ if __name__ == "__main__":
     ap.add_argument("--probe-policy", action="store_true",
                     help="不启动viewer, 用理想零位直立观测直接测试ONNX策略输出")
     ap.add_argument("--debug-push-steps", type=int, default=0,
-                    help="不启动viewer, 自动起立后在RL_BALANCE中运行固定外力测试, 单位为policy step")
+                    help="不启动viewer, 自动起立后在RL_STAND中运行固定外力测试, 单位为policy step")
     ap.add_argument("--debug-push-start", type=int, default=80,
-                    help="固定外力开始的policy step, 从进入RL_BALANCE后计数")
+                    help="固定外力开始的policy step, 从进入RL_STAND后计数")
     ap.add_argument("--debug-push-duration", type=int, default=11,
                     help="固定外力持续的policy step")
     ap.add_argument("--debug-push-force-x", type=float, default=0.0,
                     help="固定外力世界系X方向[N]")
     ap.add_argument("--debug-push-force-y", type=float, default=40.0,
                     help="固定外力世界系Y方向[N]")
+    ap.add_argument("--viewer-push-force-x", type=float, default=0.0,
+                    help="运行终端短按5施加到base_link的世界系X方向力[N]，短按6取反")
+    ap.add_argument("--viewer-push-force-y", type=float, default=0.0,
+                    help="运行终端短按5施加到base_link的世界系Y方向力[N]，短按6取反")
+    ap.add_argument("--viewer-push-force-z", type=float, default=0.0,
+                    help="运行终端短按5施加到base_link的世界系Z方向力[N]，短按6取反")
+    ap.add_argument("--viewer-push-duration", type=float, default=0.1,
+                    help="可视化定量推力持续时间[s]，默认0.1以匹配Table V大推")
     ap.add_argument("--sim-action-scale", type=float, default=None,
                     help="仅本次sim2sim运行覆盖policy action_scale")
     ap.add_argument("--sim-rl-kd", type=float, default=None,

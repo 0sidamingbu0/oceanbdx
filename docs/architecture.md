@@ -197,24 +197,34 @@ sim2sim:
 python3 sim2sim/mujoco_sim.py \
    --debug-push-steps 112 \
    --debug-push-start 80 \
-   --debug-push-duration 11 \
+   --debug-push-duration 5 \
    --debug-push-force-x 0 \
    --debug-push-force-y 0
 
-# 侧向 40N, 约 0.16s: 对齐 IsaacLab play 中的抗推测试量级
+# 侧向 60N, 0.10s: 对齐当前 Table V 大推的下沿
 python3 sim2sim/mujoco_sim.py \
    --debug-push-steps 112 \
    --debug-push-start 80 \
-   --debug-push-duration 11 \
-   --debug-push-force-y 40
+   --debug-push-duration 5 \
+   --debug-push-force-y 60
 
-# 前向 40N
+# 前向 60N
 python3 sim2sim/mujoco_sim.py \
    --debug-push-steps 112 \
    --debug-push-start 80 \
-   --debug-push-duration 11 \
-   --debug-push-force-x 40 \
+   --debug-push-duration 5 \
+   --debug-push-force-x 60 \
    --debug-push-force-y 0
+```
+
+`--debug-push-duration` 的单位是 50Hz policy step，因此 `5` 步为 `0.10s`。需要同时看 viewer
+中的动作时，改用下面的秒单位参数；按 `1` 进入 `RL_STAND` 并稳定后，在运行脚本的终端短按
+`5` 施加配置方向、短按 `6` 施加反方向：
+
+```bash
+python3 sim2sim/mujoco_sim.py \
+   --viewer-push-force-y 60 \
+   --viewer-push-duration 0.1
 ```
 
 `[sim_push_summary]` 中重点看:

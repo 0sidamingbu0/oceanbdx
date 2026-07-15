@@ -24,10 +24,11 @@
 步态相位、IMU projected gravity/gyro、腿 `q/dq` 和当前 policy target，不依赖脚底力传感器、
 MuJoCo 真值速度或 CoM。超时后 walking policy 保持零命令，不冒险强制切换。
 
-`RL_STAND → RL_WALK` 不再从蹲姿或倾斜姿态直接切模型。standing policy 先将当前 torso 命令
-用半余弦平滑回到 neutral，回正时长按命令幅度缩放，最大 `1.5s`；neutral 后至少保持 `0.3s`，
+`RL_STAND → RL_WALK` 不再从蹲姿或倾斜姿态直接切模型。standing policy 先将当前 torso 和 head 命令
+用同一条半余弦曲线平滑回到 neutral，回正时长按两者最大归一化幅度缩放，最大 `1.5s`；neutral 后至少保持 `0.3s`，
 再用同一组 IMU、腿 `q/dq` 和当前 target 连续确认稳定 `0.2s`，最后才切入 walking policy
-零速闭环。切换请求取消后仍继续平滑回 neutral，不恢复旧蹲姿；总计 `5s` 超时则留在
+零速闭环。回正期间屏蔽新的 head/torso 命令；进入 walking 后 head/torso 命令从零开始，不恢复旧姿态。
+切换请求取消后仍继续平滑回 neutral，不恢复旧蹲姿；总计 `5s` 超时则留在
 standing policy neutral，不强制切换，也不关闭电机输出。
 
 站立和行走统一使用论文附录 B 的腿部软件 PD `kP=10`、`kD=0.3`，不能再给站立模型单独
@@ -39,10 +40,9 @@ head 命令继续保留。`STAND_UP→RL_STAND`
 
 头部命令语义相同，但限幅按当前实际运行的 policy 独立选择：standing 使用完整表现域
 Δh `±0.02m`、pitch `±0.50rad`、yaw `±1.00rad`、roll `±0.60rad`；walking 为抑制行进甩头
-继续使用约 1/3 域 `±0.007m / ±0.17 / ±0.33 / ±0.20rad`。手柄映射按当前 policy 限幅；键盘
-`head_cmd` 跨模型保留原始 standing 命令，但每次 policy inference 前再按当前实际模型限幅副本，
-因此 walking 永不接收超出训练域的输入，切回 standing 后原命令仍可恢复。切换未完成时不会
-提前采用目标模型的限幅。
+继续使用约 1/3 域 `±0.007m / ±0.17 / ±0.33 / ±0.20rad`。手柄映射按当前 policy 限幅；站转走
+回正完成后 head 命令从零重新接收输入，因此 walking 永不接收超出训练域的输入，也不会恢复
+站立时的旧头部姿态。切换未完成时不会提前采用目标模型的限幅。
 
 遥控逻辑对齐论文附录 C / 表 VII：遥控模式启动时默认请求 standing，起立完成后进入 standing
 policy；standing 中按下 `R1` 立即请求行走，walking 中短按切回站立；行走中长按 `R1`
@@ -123,6 +123,7 @@ python3 sim2sim/mujoco_sim.py                 # 同时加载行走+站立两个 
 python3 sim2sim/mujoco_sim.py --gamepad       # 启用论文 R1/双摇杆遥控映射 (/dev/input/js0)
 # 站立/行走是两个独立模型: 起立(1)后进站立模型, 按 2 切行走模型, 按 1 切回站立模型
 python3 sim2sim/mujoco_sim.py --stand-policy policy/stand/policy.onnx   # 覆盖站立 onnx 路径
+python3 sim2sim/mujoco_sim.py --viewer-push-force-y 60 --viewer-push-duration 0.1  # viewer定量侧推
 python3 sim2sim/diag_walk_policy.py --vx 0.15    # 无界面前进逐脚间隙/力矩/脖子诊断
 python3 sim2sim/diag_walk_policy.py --vx -0.15   # 同口径后退诊断
 python3 -m unittest -v sim2sim/test_walk_stand_switch.py  # 切换/命令平滑回归
@@ -132,6 +133,12 @@ python3 -m unittest -v sim2sim/test_terrain_scene.py      # 地形几何/接触/
 
 `--gamepad` 会持续等待并支持热插拔 `/dev/input/js0`。看到终端输出 `[gamepad] connected` 后，
 按手柄 `START` 即可代替键盘 `1` 起立，之后可完全使用上述手柄映射操作。
+
+可视化定量推力使用世界坐标系 `--viewer-push-force-x/y/z`，作用点为 `base_link` 质心；进入
+`RL_STAND` 或 `RL_WALK` 后，在运行脚本的终端短按 `5` 施加配置方向，短按 `6` 施加反方向，可重复
+触发。默认持续 `0.1s`，与训练 Table V 大推持续时间一致；侧推建议从 `±30N` 开始，再测试
+`±60N / ±80N / ±95N`。该功能在 `--real` 模式下强制禁用；MuJoCo 窗口原有的双击选中后
+`Ctrl+右键` 鼠标拖动仍可用于不定量测试。
 
 场景保留原点附近的平地出生区，并提供两个颜色区分的测试场：机器人初始朝世界 `-X`，绿色
 坡道位于正前方 `x=[-4.2,-1.2]m`，直接按 `w` 可依次测试 `5°` 上坡、`1m` 平台和 `5°`
@@ -165,7 +172,8 @@ sole geom center 只用于接触诊断；旧算法在 neutral pose 会产生约 
 > `mujoco_sim.py --probe-policy` / `--debug-push-steps` 等纯推理工具用 base 的 `python3` 即可(只需 mujoco+onnxruntime)。
 
 键盘 (★聚焦运行脚本的**终端窗口**操作, 与真机 main.cpp 一致, 不会触发 MuJoCo 自带快捷键):
-`0`蹲姿 `1`起立/切站立模型 `2`切行走模型 `3`切站立模型(同1) `9`阻尼 `r`重置 `p`真机电机开关；
+`0`蹲姿 `1`起立/切站立模型 `2`切行走模型 `3`切站立模型(同1) `5/6` viewer定量推力正/反向；
+`9`阻尼 `r`重置 `p`真机电机开关；
 `w/s`=vx± `a/d`=vy± `q/e`=wz± `x`速度清零 (速度仅在 `2` 行走模型态生效)；
 `t/g`=躯干pitch± `v/c`=躯干yaw± `y/b`=躯干roll± `f/z`=躯干高度± (仅 `1` 站立模型态生效)；
 `i/k`=点头 `j/l`=摇头 `u/o`=歪头 `n/m`=头高 `h`=头命令清零 (站立/行走均生效)。
@@ -182,10 +190,10 @@ MuJoCo 窗口内也能按 (方向键映射到 w/s/q/e), 但数字键会附带触
 站立 torso 命令会限幅到训练可行域：h `[-0.04,+0.01]m`、pitch `±0.17rad`、yaw
 `±0.24rad`、roll `±0.09rad`。head 的 stand/walk 限幅分别由 `stand_max_head_*` 和
 `max_head_*` 配置。此前的 77 维 stand ONNX 只见过缩小后的 head 域；即使输入形状仍匹配，
-也不能直接使用完整站立限幅。必须在 OceanIsaacLab 用新命令分布和受扰恢复奖励从头训练、重新
-导出后，才替换 `policy/stand/policy.onnx[.data]`。该奖励门控由姿态、速度、角速度和
-path-frame 平面位置误差触发，并在训练前 1500 iteration 随扰动课程逐步生效；不要单独扩大
-部署限幅让旧策略外推。
+也不能直接使用完整站立限幅。必须在 OceanIsaacLab 用新的联合 head+torso 参考、命令分布和
+clean/disturbed 训练分层从头训练、重新导出后，才替换 `policy/stand/policy.onnx[.data]`。
+当前训练已删除会改变奖励权重的 recovery gate，只保留基于 IMU、状态估计和接触的诊断指标；
+不要单独扩大部署限幅让旧策略外推。
 
 sim2sim 与 IsaacLab 不一致时, 尤其是外力后单脚支撑发散、横漂或动作饱和, 先看 [docs/architecture.md](docs/architecture.md) 的 “sim2sim kd 调试记录”。
 
