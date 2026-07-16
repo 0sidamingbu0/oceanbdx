@@ -21,15 +21,16 @@
 `RL_WALK → RL_STAND` 由 walking policy 依次完成 `0.6s` 余弦减速、参考双支撑相位归零、
 `0.15s` 最终平滑过零、`0.4s` 零命令收脚和连续 `0.2s` 稳定确认，再切到 standing policy。
 正式放行只使用内部
-步态相位、IMU projected gravity/gyro、腿 `q/dq` 和当前 policy target，不依赖脚底力传感器、
+步态相位、IMU projected gravity/gyro 和腿 `q/dq`，不依赖脚底力传感器、
 MuJoCo 真值速度或 CoM。超时后 walking policy 保持零命令，不冒险强制切换。
 
 `RL_STAND → RL_WALK` 不再从蹲姿或倾斜姿态直接切模型。standing policy 先将当前 torso 和 head 命令
 用同一条半余弦曲线平滑回到 neutral，回正时长按两者最大归一化幅度缩放，最大 `1.5s`；neutral 后至少保持 `0.3s`，
-再用同一组 IMU、腿 `q/dq` 和当前 target 连续确认稳定 `0.2s`，最后才切入 walking policy
-零速闭环。回正期间屏蔽新的 head/torso 命令；进入 walking 后 head/torso 命令从零开始，不恢复旧姿态。
-切换请求取消后仍继续平滑回 neutral，不恢复旧蹲姿；总计 `5s` 超时则留在
-standing policy neutral，不强制切换，也不关闭电机输出。
+再用同一组 IMU 和腿 `q/dq` 连续确认稳定 `0.2s`，最后才切入 walking policy
+零速闭环。除此之外，还用腿编码器 q 的独立 MuJoCo FK 检查双脚相对脚距、前后错位和 yaw；
+不读取接触力、世界足端位置、CoM 或真实 base velocity。回正期间屏蔽新的 head/torso 命令；
+进入 walking 后两者从零开始，不恢复旧姿态。总计 `5s` 后仍不满足门槛时继续保持 standing
+policy neutral 闭环并保留切换请求，脚位和稳定性恢复后自动切换，不强制切换也不关闭电机输出。
 
 站立和行走统一使用论文附录 B 的腿部软件 PD `kP=10`、`kD=0.3`，不能再给站立模型单独
 使用旧高增益 plant。模型互切不恢复旧姿态：进入 standing 时 torso 命令归零并保持 neutral；
@@ -150,15 +151,17 @@ python3 -m unittest -v sim2sim/test_terrain_scene.py      # 地形几何/接触/
 当前 Python sim2sim 会严格检查 stand/walk 输入维度为 `77/80`，旧 74 维站立和 77 维行走
 ONNX 会直接拒绝加载。数字键请求在主控制循环边界消费；行走回站立时，速度命令与用户命令
 分离，减速阶段仍保持相位推进，只在训练参考的双支撑相位窗口将策略命令归零。稳定判据任意
-一帧失败都会重置确认计时，`3.5s` 超时后继续由 walking policy 以零命令保持；再次请求行走时
-由统一限加速度器平滑跟踪当前用户命令。普通加速、减速、清零和反向也使用同一控制线程平滑器；
+一帧失败都会重置确认计时，`3.5s` 超时后继续由 walking policy 以零命令保持并自动等待稳定，
+不会取消或锁死站立请求；操作员重新请求行走可取消停站。普通加速、减速、清零和反向也使用
+同一控制线程平滑器；
 清零或全向反转只有在参考双支撑窗口才允许穿过移动阈值，避免相位冻结在单支撑。
 手柄模式请求同样只在 200Hz 控制线程消费：`R1` 请求停止后复用完整 walk→stand 安全流程；
 过渡中再次请求行走会从当前 effective command 平滑恢复。稳定 neutral 站立已提前累计稳定时间，
 所以 `R1` 请求行走可在下一策略边界切模型；当前摇杆速度目标会保留，但送入 walking policy 的
-effective command 仍从零按限加速度建立。切换超时会锁存失败目标，避免相同输入自动循环重试。
-显式按 `A` 或手柄断连边沿可解除一次 standing 超时锁存并重新执行安全停站；持续不变的输入
-不会循环重试或刷日志。
+effective command 仍从零按限加速度建立。walk→stand 超时继续由 walking policy 零速保持并等待；
+stand→walk 超过等待时间后继续由 standing policy neutral 闭环校正，并在每个控制周期重新检查
+IMU、腿 q/dq 和编码器 FK 脚位。满足条件后自动完成一次切换，不会循环重启回正流程
+或刷超时日志。
 path-frame FK 使用脚 link body origin/quaternion 对齐 IsaacLab，
 sole geom center 只用于接触诊断；旧算法在 neutral pose 会产生约 `2.585cm` 的位置偏差。
 脚底接触力诊断会同时识别平地、坡道和粗糙区；离地间隙按每个脚底 box 角点下方的局部地形

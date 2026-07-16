@@ -646,9 +646,6 @@ class Sim:
         self.switch_joint_pos_error_max = float(
             sim2sim_ctrl.get("switch_joint_pos_error_max", 0.25)
         )
-        self.switch_target_error_max = float(
-            sim2sim_ctrl.get("switch_target_error_max", 0.50)
-        )
         # stand -> walk remains on the standing policy until its torso command is neutral
         # and real-robot-available IMU/encoder signals have stayed stable.
         self.stand_to_walk_recenter_max_duration = max(
@@ -671,6 +668,15 @@ class Sim:
         self.stand_to_walk_total_timeout = max(
             minimum_stand_to_walk_timeout,
             float(sim2sim_ctrl.get("stand_to_walk_total_timeout_s", 5.0)),
+        )
+        self.stand_to_walk_stance_width_error_max = float(
+            sim2sim_ctrl.get("stand_to_walk_stance_width_error_max", 0.015)
+        )
+        self.stand_to_walk_stance_stagger_error_max = float(
+            sim2sim_ctrl.get("stand_to_walk_stance_stagger_error_max", 0.020)
+        )
+        self.stand_to_walk_stance_yaw_error_max = float(
+            sim2sim_ctrl.get("stand_to_walk_stance_yaw_error_max", 0.10)
         )
         self.policy_target_prev = np.zeros(self.nj)
         self.policy_target_next = np.zeros(self.nj)
@@ -795,6 +801,14 @@ class Sim:
         self.foot_heading_offsets = np.array(
             [wrap_angle(neutral_head_yaw - yaw) for yaw in neutral_foot_yaws], dtype=float
         )
+        # A separate kinematics buffer turns real-robot leg encoders into foot-to-foot pose.
+        # It never reads simulated contacts, base velocity, or the live MuJoCo body state.
+        self._stance_fk_data = mujoco.MjData(self.model)
+        self._stance_fk_qpos = self.data.qpos.copy()
+        (
+            self.neutral_foot_relative_xy,
+            self.neutral_foot_relative_yaw,
+        ) = self._foot_relative_pose_from_joint_positions(self.stand_pose)
         neutral_feet_center = np.mean(
             [self.data.xpos[bid, :2] for bid in self.foot_body_ids], axis=0
         )
@@ -878,6 +892,7 @@ class Sim:
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "idle"
         self._walk_stop_source = None
+        self._walk_stop_timeout_reported = False
         self._stand_to_walk_stage = None
         self._stand_to_walk_total_elapsed = 0.0
         self._stand_to_walk_stage_elapsed = 0.0
@@ -1011,6 +1026,7 @@ class Sim:
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "idle"
         self._walk_stop_source = None
+        self._walk_stop_timeout_reported = False
         self._stand_to_walk_stage = None
         self._stand_to_walk_total_elapsed = 0.0
         self._stand_to_walk_stage_elapsed = 0.0
@@ -1719,6 +1735,7 @@ class Sim:
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "idle"
         self._walk_stop_source = None
+        self._walk_stop_timeout_reported = False
 
     def _clear_stand_to_walk_transition(self):
         self._stand_to_walk_stage = None
@@ -1803,6 +1820,7 @@ class Sim:
         self._walk_stop_stage_elapsed = 0.0
         self._walk_stop_stable_elapsed = 0.0
         self._walk_stop_block_reason = "decelerating"
+        self._walk_stop_timeout_reported = False
         if np.max(np.abs(self._walk_stop_start_cmd)) > self.move_command_threshold:
             self._walk_stop_stage = "DECEL"
             print(
@@ -1935,6 +1953,8 @@ class Sim:
 
     def _walk_to_stand_stable(self, q, dq, quat, gyro):
         """Return a fail-closed stability decision using real-robot-available signals only."""
+        # The target must remain numerically valid, but its distance from q is not a
+        # stability signal: low-kP policies intentionally need steady target-q offset.
         arrays = (q, dq, quat, gyro, self.rl_target)
         if not all(np.all(np.isfinite(value)) for value in arrays):
             return False, "non-finite sensor/target"
@@ -1947,7 +1967,6 @@ class Sim:
         dq_rms = float(np.sqrt(np.mean(np.square(dq))))
         dq_max = float(np.max(np.abs(dq)))
         q_error = float(np.max(np.abs(q - self.stand_pose)))
-        target_error = float(np.max(np.abs(self.rl_target - q)))
 
         blocked = []
         if proj_xy >= self.switch_proj_g_xy_max:
@@ -1964,46 +1983,98 @@ class Sim:
             blocked.append(f"dq_max={dq_max:.3f}")
         if q_error >= self.switch_joint_pos_error_max:
             blocked.append(f"q_err={q_error:.3f}")
-        if target_error >= self.switch_target_error_max:
-            blocked.append(f"target_err={target_error:.3f}")
         return not blocked, ", ".join(blocked) if blocked else "stable"
+
+    def _foot_relative_pose_from_joint_positions(self, q):
+        """Compute calibrated left-to-right foot pose from leg encoders only."""
+        q = np.asarray(q, dtype=float)
+        if q.shape != (self.nj,) or not np.all(np.isfinite(q)):
+            raise ValueError("leg encoder vector is non-finite or has the wrong shape")
+        self._stance_fk_data.qpos[:] = self._stance_fk_qpos
+        self._stance_fk_data.qpos[self.q_adr] = q
+        mujoco.mj_kinematics(self.model, self._stance_fk_data)
+        foot_xy = np.array(
+            [self._stance_fk_data.xpos[bid, :2] for bid in self.foot_body_ids]
+        )
+        raw_yaw = np.array(
+            [
+                np.arctan2(
+                    self._stance_fk_data.xmat[bid].reshape(3, 3)[1, 0],
+                    self._stance_fk_data.xmat[bid].reshape(3, 3)[0, 0],
+                )
+                for bid in self.foot_body_ids
+            ]
+        )
+        calibrated_yaw = np.array(
+            [wrap_angle(yaw + offset) for yaw, offset in zip(raw_yaw, self.foot_heading_offsets)]
+        )
+        heading = float(
+            np.arctan2(np.mean(np.sin(calibrated_yaw)), np.mean(np.cos(calibrated_yaw)))
+        )
+        delta = foot_xy[1] - foot_xy[0]
+        cos_h, sin_h = np.cos(heading), np.sin(heading)
+        relative_xy = np.array(
+            [
+                cos_h * delta[0] + sin_h * delta[1],
+                -sin_h * delta[0] + cos_h * delta[1],
+            ]
+        )
+        relative_yaw = wrap_angle(calibrated_yaw[1] - calibrated_yaw[0])
+        return relative_xy, float(relative_yaw)
 
     def _stand_to_walk_stable(self, q, dq, quat, gyro):
         stable, reason = self._walk_to_stand_stable(q, dq, quat, gyro)
+        blocked = [] if stable else [reason]
+        if np.all(np.isfinite(q)):
+            try:
+                relative_xy, relative_yaw = self._foot_relative_pose_from_joint_positions(q)
+            except ValueError as exc:
+                blocked.append(str(exc))
+            else:
+                width_error = abs(
+                    float(relative_xy[1] - self.neutral_foot_relative_xy[1])
+                )
+                stagger_error = abs(
+                    float(relative_xy[0] - self.neutral_foot_relative_xy[0])
+                )
+                yaw_error = abs(
+                    wrap_angle(relative_yaw - self.neutral_foot_relative_yaw)
+                )
+                if width_error >= self.stand_to_walk_stance_width_error_max:
+                    blocked.append(f"stance_width_err={width_error:.3f}")
+                if stagger_error >= self.stand_to_walk_stance_stagger_error_max:
+                    blocked.append(f"stance_stagger_err={stagger_error:.3f}")
+                if yaw_error >= self.stand_to_walk_stance_yaw_error_max:
+                    blocked.append(f"stance_yaw_err={yaw_error:.3f}")
         if not np.all(np.isfinite(self._effective_torso_cmd)):
             return False, "non-finite torso command"
         torso_error = float(np.max(np.abs(self._effective_torso_cmd)))
         if torso_error > 1.0e-6:
-            extra = f"torso_cmd={torso_error:.4f}"
-            return False, f"{reason}, {extra}" if reason != "stable" else extra
-        return stable, reason
+            blocked.append(f"torso_cmd={torso_error:.4f}")
+        return not blocked, ", ".join(blocked) if blocked else "stable"
 
     def _update_stand_to_walk(self, q, dq, quat, gyro, policy_boundary):
         self._stand_to_walk_total_elapsed += self.control_dt
         if self._stand_to_walk_total_elapsed >= self.stand_to_walk_total_timeout:
             reason = self._stand_to_walk_block_reason or "transition timeout"
-            source = self._stand_to_walk_source
-            preserve_walk_command = self._stand_to_walk_preserve_walk_command
-            self.pending_rl_state = None
-            if not preserve_walk_command:
-                self.cmd[:] = 0.0
+            self.pending_rl_state = "RL_WALK"
             self._effective_walk_cmd[:] = 0.0
             self.head_cmd[:] = 0.0
             self.torso_cmd[:] = 0.0
-            if source == "gamepad":
-                self._puppeteer_blocked_target = "RL_WALK"
             if self._stand_to_walk_stage in ("WAIT_GAIN_BLEND", "RECENTER"):
                 # Do not turn a timeout into the same torso-command jump this FSM prevents.
-                # Finish the already-running recenter, then remain on the standing policy.
-                self._stand_to_walk_cancelled = True
+                # Finish recentering, then continue waiting on the standing policy.
                 self._stand_to_walk_total_elapsed = 0.0
             else:
                 self._effective_torso_cmd[:] = 0.0
                 self._stand_to_walk_effective_head_cmd[:] = 0.0
-                self._clear_stand_to_walk_transition()
+                self._stand_to_walk_total_elapsed = 0.0
+                self._stand_to_walk_stage_elapsed = self.stand_to_walk_zero_hold_duration
+                self._stand_to_walk_stable_elapsed = 0.0
             print(
                 "[FSM] stand->walk timeout after "
-                f"{self.stand_to_walk_total_timeout:.2f}s ({reason}); remain RL_STAND neutral"
+                f"{self.stand_to_walk_total_timeout:.2f}s ({reason}); "
+                "remain RL_STAND neutral and keep waiting"
             )
             return
 
@@ -2072,13 +2143,23 @@ class Sim:
 
     def _update_walk_to_stand(self, q, dq, quat, gyro, policy_boundary):
         self._walk_stop_total_elapsed += self.control_dt
-        if self._walk_stop_total_elapsed >= self.switch_total_timeout:
+        if (
+            self._walk_stop_total_elapsed >= self.switch_total_timeout
+            and not self._walk_stop_timeout_reported
+        ):
             reason = self._walk_stop_block_reason or "transition timeout"
-            self._cancel_walk_to_stand(
-                f"timeout after {self._walk_stop_total_elapsed:.2f}s ({reason})",
-                resume_command=False,
+            self._walk_stop_timeout_reported = True
+            self.pending_rl_state = "RL_STAND"
+            self.cmd[:] = 0.0
+            self._effective_walk_cmd[:] = 0.0
+            self._walk_stop_stage = "ZERO_HOLD"
+            self._walk_stop_stage_elapsed = self.switch_zero_hold_duration
+            self._walk_stop_stable_elapsed = 0.0
+            print(
+                "[FSM] walk->stand timeout after "
+                f"{self._walk_stop_total_elapsed:.2f}s ({reason}); "
+                "keep RL_WALK at zero command and continue waiting"
             )
-            return
 
         if self._walk_stop_stage == "DECEL":
             self._walk_stop_stage_elapsed += self.control_dt

@@ -212,7 +212,7 @@ oceanbdx:
     action_lowpass_cutoff_hz: 37.5
     neck_torque_limits: [5.0, 5.0, 5.0, 5.0]
     # walk -> stand：仍由 walking policy 完成减速和零命令收脚，再在参考双支撑相位切换。
-    # 正式判据只使用真机可靠可得的内部相位、IMU projected gravity/gyro 和腿 q/dq/target；
+    # 正式判据只使用真机可靠可得的内部相位、IMU projected gravity/gyro 和腿 q/dq；
     # MuJoCo 接触力、真值 base velocity、CoM 不参与放行。
     switch_decel_duration_s: 0.6
     switch_min_moving_command: 0.09       # > move_command_threshold，防止单支撑时相位冻结
@@ -228,15 +228,16 @@ oceanbdx:
     switch_joint_vel_rms_max: 0.30
     switch_joint_vel_max: 0.80
     switch_joint_pos_error_max: 0.25
-    # 低刚度腿部 PD 从最大命令回零时可有约 0.40rad 的 target-q 稳态偏差；
-    # 该项只拦截明显目标跳变，惯性是否消除主要由 IMU 与 dq 判据决定。
-    switch_target_error_max: 0.50
     # stand -> walk：先继续使用 standing policy 将任意躯干姿态平滑回 neutral，
     # 再由 IMU 与编码器连续确认稳定后切换。超时保持 standing policy neutral 闭环。
     stand_to_walk_recenter_max_duration_s: 1.5
     stand_to_walk_zero_hold_duration_s: 0.30
     stand_to_walk_stable_confirm_duration_s: 0.20
     stand_to_walk_total_timeout_s: 5.0
+    # q 编码器通过 URDF FK 得到双脚相对位姿；不依赖接触力或世界系足端定位。
+    stand_to_walk_stance_width_error_max: 0.015
+    stand_to_walk_stance_stagger_error_max: 0.020
+    stand_to_walk_stance_yaw_error_max: 0.10
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机

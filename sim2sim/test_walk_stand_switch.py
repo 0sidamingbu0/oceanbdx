@@ -156,8 +156,15 @@ class WalkStandSwitchTest(unittest.TestCase):
                 allowed, _ = self.sim._walk_to_stand_stable(q, dq, quat, gyro)
                 self.assertFalse(allowed)
 
+        # Low-kP policies intentionally use target-q offset to generate support torque.
+        # It is controller state, not a physical stability signal, and must not block switching.
         original_target = self.sim.rl_target.copy()
-        self.sim.rl_target = self.q + self.sim.switch_target_error_max
+        self.sim.rl_target = self.q + 0.8
+        allowed, _ = self.sim._walk_to_stand_stable(
+            self.q, self.dq, self.quat, self.gyro
+        )
+        self.assertTrue(allowed)
+        self.sim.rl_target[0] = np.nan
         allowed, _ = self.sim._walk_to_stand_stable(
             self.q, self.dq, self.quat, self.gyro
         )
@@ -428,9 +435,14 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.gyro[0] = self.sim.switch_gyro_xy_max
         self.update(3)
         self.assertEqual(self.sim.state, "RL_WALK")
-        self.assertIsNone(self.sim.pending_rl_state)
+        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
+        self.assertEqual(self.sim._walk_stop_stage, "ZERO_HOLD")
         np.testing.assert_allclose(self.sim.cmd, 0.0)
         np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
+
+        self.gyro[:] = 0.0
+        self.update(int(np.ceil(self.sim.switch_stable_confirm_duration / self.sim.control_dt)))
+        self.assertEqual(self.sim.state, "RL_STAND")
 
     def test_policy_history_and_applied_targets_are_continuous(self):
         previous = np.linspace(-0.5, 0.5, self.sim.walk_policy.n_act).astype(np.float32)
@@ -599,6 +611,7 @@ class WalkStandSwitchTest(unittest.TestCase):
     def test_stand_to_walk_timeout_keeps_standing_neutral(self):
         self.set_stand()
         self.sim.stand_to_walk_zero_hold_duration = 0.0
+        self.sim.stand_to_walk_stable_confirm_duration = 2 * self.sim.control_dt
         self.sim.stand_to_walk_total_timeout = 3 * self.sim.control_dt
         self.gyro[0] = self.sim.switch_gyro_xy_max
         self.request("RL_WALK")
@@ -606,12 +619,40 @@ class WalkStandSwitchTest(unittest.TestCase):
 
         self.assertEqual(self.sim.state, "RL_STAND")
         self.assertIs(self.sim.policy, self.sim.stand_policy)
-        self.assertIsNone(self.sim.pending_rl_state)
-        self.assertIsNone(self.sim._stand_to_walk_stage)
+        self.assertEqual(self.sim.pending_rl_state, "RL_WALK")
+        self.assertEqual(self.sim._stand_to_walk_stage, "ZERO_HOLD")
         np.testing.assert_allclose(self.sim.cmd, 0.0)
         np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
         np.testing.assert_allclose(self.sim.torso_cmd, 0.0)
         np.testing.assert_allclose(self.sim._effective_torso_cmd, 0.0)
+
+        self.gyro[:] = 0.0
+        self.update(2)
+        self.assertEqual(self.sim.state, "RL_WALK")
+
+    def test_stand_to_walk_requires_canonical_encoder_fk_stance(self):
+        relative_xy, relative_yaw = self.sim._foot_relative_pose_from_joint_positions(
+            self.sim.stand_pose
+        )
+        np.testing.assert_allclose(relative_xy, self.sim.neutral_foot_relative_xy)
+        self.assertAlmostEqual(relative_yaw, self.sim.neutral_foot_relative_yaw)
+
+        # Stable 50 mm narrow-stance IK pose. Its joint error passes the old q-only gate,
+        # but encoder FK must keep the standing policy active until the feet are restored.
+        narrow_q = np.array(
+            [-0.013, -0.109, -0.060, 0.096, 0.037,
+             0.013, 0.107, 0.059, -0.095, -0.036]
+        )
+        self.sim.rl_target = narrow_q.copy()
+        common_stable, _ = self.sim._walk_to_stand_stable(
+            narrow_q, self.dq, self.quat, self.gyro
+        )
+        self.assertTrue(common_stable)
+        stable, reason = self.sim._stand_to_walk_stable(
+            narrow_q, self.dq, self.quat, self.gyro
+        )
+        self.assertFalse(stable)
+        self.assertIn("stance_width_err", reason)
 
     def test_neutral_stand_to_walk_uses_fast_path(self):
         self.set_stand()
@@ -624,6 +665,60 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.assertEqual(self.sim.state, "RL_STAND")
         self.update()
         self.assertEqual(self.sim.state, "RL_WALK")
+
+    def test_current_onnx_startup_and_walking_round_trip_meets_latency_bounds(self):
+        """Cover the real stand-up plant and current policies, not only ideal q=0 inputs."""
+        sim_steps_per_control = max(
+            1,
+            int(round(self.sim.control_dt / self.sim.model.opt.timestep)),
+        )
+
+        def physics_step():
+            tau, neck_tau = self.sim.control_step()
+            for _ in range(sim_steps_per_control):
+                self.sim.data.qfrc_applied[:] = 0.0
+                self.sim.data.qfrc_applied[self.sim.v_adr] = tau
+                self.sim.data.qfrc_applied[self.sim.neck_v_adr] = neck_tau
+                ms.mujoco.mj_step(self.sim.model, self.sim.data)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.sim.reset()
+            self.sim._cmd_key("1")
+            for _ in range(int(np.ceil(4.0 / self.sim.control_dt))):
+                physics_step()
+                if self.sim.state == "RL_STAND":
+                    break
+            self.assertEqual(self.sim.state, "RL_STAND")
+
+            self.sim._switch_rl_state("RL_WALK")
+            stand_to_walk_steps = 0
+            for stand_to_walk_steps in range(int(np.ceil(2.0 / self.sim.control_dt))):
+                physics_step()
+                if self.sim.state == "RL_WALK":
+                    break
+            self.assertEqual(self.sim.state, "RL_WALK")
+            self.assertLessEqual(
+                (stand_to_walk_steps + 1) * self.sim.control_dt,
+                2.0,
+            )
+
+            self.sim.cmd[:] = [0.25, 0.0, 0.0]
+            for _ in range(int(np.ceil(4.0 / self.sim.control_dt))):
+                physics_step()
+            self.assertEqual(self.sim.state, "RL_WALK")
+
+            self.sim._switch_rl_state("RL_STAND")
+            walk_to_stand_steps = 0
+            for walk_to_stand_steps in range(int(np.ceil(3.0 / self.sim.control_dt))):
+                physics_step()
+                if self.sim.state == "RL_STAND":
+                    break
+            self.assertEqual(self.sim.state, "RL_STAND")
+            self.assertLessEqual(
+                (walk_to_stand_steps + 1) * self.sim.control_dt,
+                3.0,
+            )
+            self.assertFalse(self.sim._walk_stop_timeout_reported)
 
     def test_gamepad_centered_stick_does_not_leave_requested_walk_mode(self):
         self.sim.puppeteer.walk_requested = True
@@ -855,7 +950,7 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.assertTrue(self.sim._stand_to_walk_cancelled)
         self.assertEqual(output.getvalue().count("stand->walk cancelled"), 1)
 
-    def test_gamepad_switch_timeout_is_latched_until_mode_changes(self):
+    def test_gamepad_switch_timeout_keeps_waiting_until_stable(self):
         self.sim.gamepad_enabled = True
         self.sim.puppeteer.walk_requested = False
         self.sim.pending_rl_state = "RL_STAND"
@@ -868,16 +963,18 @@ class WalkStandSwitchTest(unittest.TestCase):
         neutral = self.gamepad_snapshot()
         self.gamepad_update(neutral, 2)
         self.assertEqual(self.sim.state, "RL_WALK")
-        self.assertIsNone(self.sim.pending_rl_state)
-        self.assertEqual(self.sim._puppeteer_blocked_target, "RL_STAND")
+        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
+        self.assertIsNone(self.sim._puppeteer_blocked_target)
+        self.assertEqual(self.sim._walk_stop_stage, "ZERO_HOLD")
 
-        self.gamepad_update(neutral, 20)
+        self.gyro[:] = 0.0
+        ready_steps = int(
+            np.ceil(self.sim.switch_stable_confirm_duration / self.sim.control_dt)
+        )
+        self.gamepad_update(neutral, ready_steps)
+        self.assertEqual(self.sim.state, "RL_STAND")
         self.assertIsNone(self.sim.pending_rl_state)
         self.assertIsNone(self.sim._walk_stop_stage)
-
-        self.gamepad_update(self.gamepad_snapshot(buttons={0: 1}))
-        self.assertIsNone(self.sim._puppeteer_blocked_target)
-        self.assertEqual(self.sim.pending_rl_state, "RL_STAND")
 
 
 if __name__ == "__main__":
