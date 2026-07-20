@@ -42,7 +42,7 @@ class PuppeteeringMapperTest(unittest.TestCase):
         self.max_vel = np.array([0.25, 0.15, 0.8])
         self.torso_min = np.array([-0.04, -0.17, -0.24, -0.09])
         self.torso_max = np.array([0.01, 0.17, 0.24, 0.09])
-        self.max_head = np.array([0.007, 0.17, 0.33, 0.20])
+        self.max_head = np.array([0.01, 0.25, 0.50, 0.30])
         self.mapper = PuppeteeringMapper(
             self.cfg, self.max_vel, self.torso_min, self.torso_max, self.max_head
         )
@@ -165,6 +165,16 @@ class PuppeteeringMapperTest(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "config/oceanbdx.yaml"), encoding="utf-8") as stream:
             project = yaml.safe_load(stream)["oceanbdx"]
+        command = project["command"]
+        np.testing.assert_allclose(
+            [
+                command["max_head_dh"],
+                command["max_head_pitch"],
+                command["max_head_yaw"],
+                command["max_head_roll"],
+            ],
+            self.max_head,
+        )
         mapping = project["puppeteering"]["mapping"]
         self.assertEqual(
             mapping,

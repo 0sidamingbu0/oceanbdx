@@ -589,6 +589,24 @@ class Sim:
         self.motor_qd_s = 0.1
         cutoff = float(sim2sim_ctrl.get("action_lowpass_cutoff_hz", 37.5))
         self.target_lowpass_alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff * self.control_dt)
+        self.neck_target_velocity_limit = float(
+            sim2sim_ctrl.get("neck_target_velocity_limit", 1.0)
+        )
+        self.neck_target_acceleration_limit = float(
+            sim2sim_ctrl.get("neck_target_acceleration_limit", 12.0)
+        )
+        if (
+            not np.isfinite(self.neck_target_velocity_limit)
+            or self.neck_target_velocity_limit <= 0.0
+        ):
+            raise ValueError("sim2sim.neck_target_velocity_limit must be positive and finite")
+        if (
+            not np.isfinite(self.neck_target_acceleration_limit)
+            or self.neck_target_acceleration_limit <= 0.0
+        ):
+            raise ValueError(
+                "sim2sim.neck_target_acceleration_limit must be positive and finite"
+            )
         self.move_command_threshold = float(
             full["policy"].get("move_command_threshold", 0.08)
         )
@@ -668,15 +686,6 @@ class Sim:
         self.stand_to_walk_total_timeout = max(
             minimum_stand_to_walk_timeout,
             float(sim2sim_ctrl.get("stand_to_walk_total_timeout_s", 5.0)),
-        )
-        self.stand_to_walk_stance_width_error_max = float(
-            sim2sim_ctrl.get("stand_to_walk_stance_width_error_max", 0.015)
-        )
-        self.stand_to_walk_stance_stagger_error_max = float(
-            sim2sim_ctrl.get("stand_to_walk_stance_stagger_error_max", 0.020)
-        )
-        self.stand_to_walk_stance_yaw_error_max = float(
-            sim2sim_ctrl.get("stand_to_walk_stance_yaw_error_max", 0.10)
         )
         self.policy_target_prev = np.zeros(self.nj)
         self.policy_target_next = np.zeros(self.nj)
@@ -840,12 +849,27 @@ class Sim:
             raise ValueError("command.torso_command_min/max must each contain four values")
         if np.any(self.torso_command_min >= self.torso_command_max):
             raise ValueError("command.torso_command_min must be smaller than torso_command_max")
+        self.torso_command_velocity_limits = np.asarray(
+            cmd_cfg.get("torso_command_velocity_limits", [0.08, 1.0, 1.2, 0.8]),
+            dtype=float,
+        )
+        self.torso_command_acceleration_limits = np.asarray(
+            cmd_cfg.get("torso_command_acceleration_limits", [0.8, 10.0, 12.0, 8.0]),
+            dtype=float,
+        )
+        for name, limits in (
+            ("torso_command_velocity_limits", self.torso_command_velocity_limits),
+            ("torso_command_acceleration_limits", self.torso_command_acceleration_limits),
+        ):
+            if limits.shape != (4,) or not np.all(np.isfinite(limits)) or np.any(limits <= 0.0):
+                raise ValueError(f"command.{name} must contain four positive finite values")
+        self._effective_torso_velocity = np.zeros(4, dtype=float)
         self.stand_base_height = float(pcfg_full.get("stand_base_height", 0.38498640060424805))
         self.walk_max_head = np.array([
-            float(cmd_cfg.get("max_head_dh", 0.007)),
-            float(cmd_cfg.get("max_head_pitch", 0.17)),
-            float(cmd_cfg.get("max_head_yaw", 0.33)),
-            float(cmd_cfg.get("max_head_roll", 0.20)),
+            float(cmd_cfg.get("max_head_dh", 0.01)),
+            float(cmd_cfg.get("max_head_pitch", 0.25)),
+            float(cmd_cfg.get("max_head_yaw", 0.50)),
+            float(cmd_cfg.get("max_head_roll", 0.30)),
         ], dtype=np.float32)
         self.stand_max_head = np.array([
             float(cmd_cfg.get("stand_max_head_dh", 0.02)),
@@ -879,6 +903,7 @@ class Sim:
         self.neck_policy_target_prev = self.neck_default.copy()
         self.neck_policy_target_next = self.neck_default.copy()
         self.filtered_neck_target = self.neck_default.copy()
+        self.neck_target_velocity = np.zeros(self.n_neck, dtype=float)
 
         self.state = "SIT"
         self.state_time = 0.0
@@ -1071,9 +1096,11 @@ class Sim:
         self.neck_policy_target_prev = self.neck_default.copy()
         self.neck_policy_target_next = self.neck_default.copy()
         self.filtered_neck_target = self.neck_default.copy()
+        self.neck_target_velocity[:] = 0.0
         self.head_cmd[:] = 0.0
         self.torso_cmd[:] = 0.0
         self._effective_torso_cmd[:] = 0.0
+        self._effective_torso_velocity[:] = 0.0
         for pol in (self.walk_policy, self.stand_policy):
             if pol is not None:
                 pol.reset()
@@ -1844,6 +1871,7 @@ class Sim:
 
     def _start_stand_recenter(self):
         self._stand_to_walk_start_torso_cmd[:] = self._effective_torso_cmd
+        self._effective_torso_velocity[:] = 0.0
         torso_extent = np.maximum(
             np.abs(self.torso_command_min), np.abs(self.torso_command_max)
         )
@@ -2023,29 +2051,15 @@ class Sim:
         return relative_xy, float(relative_yaw)
 
     def _stand_to_walk_stable(self, q, dq, quat, gyro):
+        """Require a settled, approximately neutral body without exact foot placement.
+
+        The common gate already bounds IMU tilt/rates, leg velocity, and each leg joint's
+        distance from the shared neutral pose. Encoder-FK foot placement is useful as a
+        diagnostic, but a standing policy cannot always correct it without first entering
+        the walking policy; making it a hard gate can therefore deadlock this transition.
+        """
         stable, reason = self._walk_to_stand_stable(q, dq, quat, gyro)
         blocked = [] if stable else [reason]
-        if np.all(np.isfinite(q)):
-            try:
-                relative_xy, relative_yaw = self._foot_relative_pose_from_joint_positions(q)
-            except ValueError as exc:
-                blocked.append(str(exc))
-            else:
-                width_error = abs(
-                    float(relative_xy[1] - self.neutral_foot_relative_xy[1])
-                )
-                stagger_error = abs(
-                    float(relative_xy[0] - self.neutral_foot_relative_xy[0])
-                )
-                yaw_error = abs(
-                    wrap_angle(relative_yaw - self.neutral_foot_relative_yaw)
-                )
-                if width_error >= self.stand_to_walk_stance_width_error_max:
-                    blocked.append(f"stance_width_err={width_error:.3f}")
-                if stagger_error >= self.stand_to_walk_stance_stagger_error_max:
-                    blocked.append(f"stance_stagger_err={stagger_error:.3f}")
-                if yaw_error >= self.stand_to_walk_stance_yaw_error_max:
-                    blocked.append(f"stance_yaw_err={yaw_error:.3f}")
         if not np.all(np.isfinite(self._effective_torso_cmd)):
             return False, "non-finite torso command"
         torso_error = float(np.max(np.abs(self._effective_torso_cmd)))
@@ -2267,6 +2281,7 @@ class Sim:
             self.torso_cmd[:] = 0.0
             self._effective_torso_cmd[:] = 0.0
             label = "stand model" if self.stand_policy else "stand(回退行走模型)"
+        self._effective_torso_velocity[:] = 0.0
 
         if source_policy is not None:
             previous_actions = source_policy.last_actions.copy()
@@ -2359,6 +2374,62 @@ class Sim:
             self._complete_rl_switch(self.pending_rl_state)
         elif self.state == "RL_WALK":
             self._update_walk_command_smoothing()
+
+    def _advance_motion_limited_target(
+        self,
+        current,
+        velocity,
+        desired_target,
+        lower,
+        upper,
+        velocity_limits,
+        acceleration_limits,
+    ):
+        """Advance a position command with per-axis velocity and acceleration bounds."""
+        desired_target = np.clip(np.asarray(desired_target, dtype=float), lower, upper)
+        error = desired_target - current
+        accel = np.asarray(acceleration_limits, dtype=float)
+        max_velocity = np.asarray(velocity_limits, dtype=float)
+        # Include the next integration step in the braking envelope so abrupt reversals and
+        # the final stop both stay inside the acceleration bound.
+        accel_step = accel * self.control_dt
+        stopping_speed = np.maximum(
+            0.0,
+            np.sqrt(accel_step**2 + 2.0 * accel * np.abs(error)) - accel_step,
+        )
+        desired_velocity = np.sign(error) * np.minimum(max_velocity, stopping_speed)
+        max_velocity_step = accel_step
+        velocity += np.clip(
+            desired_velocity - velocity,
+            -max_velocity_step,
+            max_velocity_step,
+        )
+        current += velocity * self.control_dt
+        current[:] = np.clip(current, lower, upper)
+
+    def _advance_neck_target(self, desired_target):
+        """Advance the neck motor setpoint with bounded velocity and acceleration."""
+        self._advance_motion_limited_target(
+            self.neck_target,
+            self.neck_target_velocity,
+            desired_target,
+            self.neck_lower,
+            self.neck_upper,
+            self.neck_target_velocity_limit,
+            self.neck_target_acceleration_limit,
+        )
+
+    def _advance_torso_command(self, desired_command):
+        """Advance the standing torso command without an instantaneous policy input jump."""
+        self._advance_motion_limited_target(
+            self._effective_torso_cmd,
+            self._effective_torso_velocity,
+            desired_command,
+            self.torso_command_min,
+            self.torso_command_max,
+            self.torso_command_velocity_limits,
+            self.torso_command_acceleration_limits,
+        )
 
     # ---------- 真机输出 ----------
     def disable_real_output(self, reason=""):
@@ -2486,6 +2557,7 @@ class Sim:
                 self.neck_policy_target_prev = self.neck_default.copy()
                 self.neck_policy_target_next = self.neck_default.copy()
                 self.filtered_neck_target = self.neck_default.copy()
+                self.neck_target_velocity[:] = 0.0
                 self.policy_substep = self.decimation
                 self.rl_tick = 0
                 if self.policy:
@@ -2497,6 +2569,7 @@ class Sim:
                 self._effective_torso_cmd[:] = self._stand_command_from_reliable_pose(
                     target_torso_command
                 )
+                self._effective_torso_velocity[:] = 0.0
                 self._rl_gain_blend_start_torso_command = self._effective_torso_cmd.copy()
                 self._rl_gain_blend_target_torso_command = target_torso_command
                 self.state, self.state_time = "RL_STAND", 0.0
@@ -2516,8 +2589,9 @@ class Sim:
                     self._rl_gain_blend_start_torso_command * (1.0 - blend)
                     + self._rl_gain_blend_target_torso_command * blend
                 )
+                self._effective_torso_velocity[:] = 0.0
             elif self.state == "RL_STAND" and self._stand_to_walk_stage is None:
-                self._effective_torso_cmd[:] = self.torso_cmd
+                self._advance_torso_command(self.torso_cmd)
             # 按状态选活动模型：RL_WALK→行走模型(cmd 速度)，RL_STAND→站立模型(torso 命令)
             if self.state == "RL_WALK":
                 self.policy = self.walk_policy
@@ -2583,7 +2657,7 @@ class Sim:
                     interpolated_neck_target - self.filtered_neck_target
                 )
                 self.rl_target = self.filtered_policy_target.copy()
-                self.neck_target = self.filtered_neck_target.copy()
+                self._advance_neck_target(self.filtered_neck_target)
                 self.rl_tick += 1
                 target, kp, kd = self.rl_target, self.kp, self.kd
                 if fresh_policy and self.run_logger is not None:

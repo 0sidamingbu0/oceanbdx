@@ -155,11 +155,11 @@ oceanbdx:
     # 单位分别为 [m/s^2, m/s^2, rad/s^2]。减速到零/反向时还会等待参考双支撑相位过零。
     walk_command_accel_limits: [0.50, 0.40, 1.50]
     walk_command_decel_limits: [0.40, 0.30, 1.20]
-    # 行走头部命令范围（与 walk cfg 一致，保留约 1/3 限幅以抑制行进时甩头）。
-    max_head_dh: 0.007
-    max_head_pitch: 0.17
-    max_head_yaw: 0.33
-    max_head_roll: 0.20
+    # 行走头部命令范围（与 walk cfg 一致，使用完整可达域的 1/2）。
+    max_head_dh: 0.01
+    max_head_pitch: 0.25
+    max_head_yaw: 0.50
+    max_head_roll: 0.30
     # 站立表现性命令使用 neck_head_map 的完整可达域；必须配套重新训练后的 StandPaper ONNX。
     stand_max_head_dh: 0.02
     stand_max_head_pitch: 0.50
@@ -169,6 +169,9 @@ oceanbdx:
     # 高度上下限不对称，不能用单个绝对 max 表示。
     torso_command_min: [-0.04, -0.17, -0.24, -0.09]
     torso_command_max: [0.01, 0.17, 0.24, 0.09]
+    # standing 身体命令二阶轨迹限制，顺序 [高度, pitch, yaw, roll]。
+    torso_command_velocity_limits: [0.08, 1.0, 1.2, 0.8]       # [m/s, rad/s...]
+    torso_command_acceleration_limits: [0.8, 10.0, 12.0, 8.0]  # [m/s^2, rad/s^2...]
 
   # ---- 论文附录 C / 表 VII 遥控映射（sim2sim --gamepad）----
   puppeteering:
@@ -210,6 +213,9 @@ oceanbdx:
     rl_kp: [10, 10, 10, 10, 10,  10, 10, 10, 10, 10]
     rl_kd: [0.3, 0.3, 0.3, 0.3, 0.3,  0.3, 0.3, 0.3, 0.3, 0.3]
     action_lowpass_cutoff_hz: 37.5
+    # 最终脖子位置目标的二阶轨迹限制。先限加速度并在接近目标时提前制动，再限最高速度。
+    neck_target_velocity_limit: 1.0       # [rad/s]
+    neck_target_acceleration_limit: 12.0  # [rad/s^2]
     neck_torque_limits: [5.0, 5.0, 5.0, 5.0]
     # walk -> stand：仍由 walking policy 完成减速和零命令收脚，再在参考双支撑相位切换。
     # 正式判据只使用真机可靠可得的内部相位、IMU projected gravity/gyro 和腿 q/dq；
@@ -234,10 +240,8 @@ oceanbdx:
     stand_to_walk_zero_hold_duration_s: 0.30
     stand_to_walk_stable_confirm_duration_s: 0.20
     stand_to_walk_total_timeout_s: 5.0
-    # q 编码器通过 URDF FK 得到双脚相对位姿；不依赖接触力或世界系足端定位。
-    stand_to_walk_stance_width_error_max: 0.015
-    stand_to_walk_stance_stagger_error_max: 0.020
-    stand_to_walk_stance_yaw_error_max: 0.10
+    # 大致 neutral 姿态由上面的 q 误差门槛保证；精确脚距/错位/yaw 不参与切换，
+    # 避免 standing policy 无法主动修脚时永久卡死。
 
   # ---- 真机联调 (sim2sim/mujoco_sim.py --real / --manual) ----
   # 架构: MuJoCo(Python) <--UDP--> oceanbdx_teleop(C++, 复用 LegDriver) --485--> 电机

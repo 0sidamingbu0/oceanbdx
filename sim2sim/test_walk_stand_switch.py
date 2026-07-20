@@ -479,6 +479,60 @@ class WalkStandSwitchTest(unittest.TestCase):
         np.testing.assert_allclose(self.sim.cmd, 0.0)
         np.testing.assert_allclose(self.sim._effective_walk_cmd, 0.0)
 
+    def test_neck_target_motion_limits_velocity_and_acceleration(self):
+        self.sim.neck_target[:] = 0.0
+        self.sim.neck_target_velocity[:] = 0.0
+        desired = np.array([0.3, -0.5, 0.9, -0.5])
+        positions = [self.sim.neck_target.copy()]
+        for step in range(800):
+            target = desired if step < 200 else -desired
+            self.sim._advance_neck_target(target)
+            positions.append(self.sim.neck_target.copy())
+
+        positions = np.asarray(positions)
+        velocities = np.diff(positions, axis=0) / self.sim.control_dt
+        accelerations = np.diff(
+            np.vstack([np.zeros((1, self.sim.n_neck)), velocities]), axis=0
+        ) / self.sim.control_dt
+        self.assertLessEqual(
+            float(np.max(np.abs(velocities))),
+            self.sim.neck_target_velocity_limit + 1.0e-5,
+        )
+        self.assertLessEqual(
+            float(np.max(np.abs(accelerations))),
+            self.sim.neck_target_acceleration_limit + 5.0e-3,
+        )
+        np.testing.assert_allclose(self.sim.neck_target, -desired, atol=2.0e-3)
+
+    def test_torso_command_limits_velocity_and_acceleration(self):
+        self.sim._effective_torso_cmd[:] = 0.0
+        self.sim._effective_torso_velocity[:] = 0.0
+        first = np.array([-0.04, 0.15, 0.20, 0.08])
+        second = np.array([0.01, -0.15, -0.20, -0.08])
+        positions = [self.sim._effective_torso_cmd.copy()]
+        for step in range(600):
+            self.sim._advance_torso_command(first if step < 150 else second)
+            positions.append(self.sim._effective_torso_cmd.copy())
+
+        positions = np.asarray(positions)
+        velocities = np.diff(positions, axis=0) / self.sim.control_dt
+        accelerations = np.diff(
+            np.vstack([np.zeros((1, 4)), velocities]), axis=0
+        ) / self.sim.control_dt
+        self.assertTrue(
+            np.all(
+                np.max(np.abs(velocities), axis=0)
+                <= self.sim.torso_command_velocity_limits + 1.0e-5
+            )
+        )
+        self.assertTrue(
+            np.all(
+                np.max(np.abs(accelerations), axis=0)
+                <= self.sim.torso_command_acceleration_limits + 1.0e-3
+            )
+        )
+        np.testing.assert_allclose(self.sim._effective_torso_cmd, second, atol=2.0e-3)
+
     def test_switch_to_walk_clears_model_specific_commands(self):
         self.sim.state = "RL_STAND"
         self.sim.policy = self.sim.stand_policy
@@ -630,15 +684,15 @@ class WalkStandSwitchTest(unittest.TestCase):
         self.update(2)
         self.assertEqual(self.sim.state, "RL_WALK")
 
-    def test_stand_to_walk_requires_canonical_encoder_fk_stance(self):
+    def test_stand_to_walk_allows_stable_noncanonical_encoder_fk_stance(self):
         relative_xy, relative_yaw = self.sim._foot_relative_pose_from_joint_positions(
             self.sim.stand_pose
         )
         np.testing.assert_allclose(relative_xy, self.sim.neutral_foot_relative_xy)
         self.assertAlmostEqual(relative_yaw, self.sim.neutral_foot_relative_yaw)
 
-        # Stable 50 mm narrow-stance IK pose. Its joint error passes the old q-only gate,
-        # but encoder FK must keep the standing policy active until the feet are restored.
+        # A stable 50 mm narrow-stance IK pose remains approximately neutral in joint space.
+        # Exact encoder-FK foot placement must not deadlock entry into the walking policy.
         narrow_q = np.array(
             [-0.013, -0.109, -0.060, 0.096, 0.037,
              0.013, 0.107, 0.059, -0.095, -0.036]
@@ -651,8 +705,7 @@ class WalkStandSwitchTest(unittest.TestCase):
         stable, reason = self.sim._stand_to_walk_stable(
             narrow_q, self.dq, self.quat, self.gyro
         )
-        self.assertFalse(stable)
-        self.assertIn("stance_width_err", reason)
+        self.assertTrue(stable, reason)
 
     def test_neutral_stand_to_walk_uses_fast_path(self):
         self.set_stand()
