@@ -143,11 +143,11 @@
         </body>
       </body>
       <body name="leg_l1_link" pos="0.0207709 -0.0471506 -0.0423" quat="0 -1 0 0">
-        <inertial pos="-0.0041201 0.0059563 0.050091" quat="0.99877 -0.0199293 -0.0453931 -0.00117301" mass="0.33145" diaginertia="0.000500453 0.000305872 0.000254596"/>
+        <inertial pos="-0.0041201 0.0059563 0.050091" quat="0.99877 -0.0199293 -0.0453931 -0.00117301" mass="0.33146" diaginertia="0.000500468 0.000305881 0.000254603"/>
         <joint name="leg_l1_joint" pos="0 0 0" axis="0 0 -1" range="-0.349 0.436" actuatorfrcrange="-100 100"/>
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l1_link"/>
         <body name="leg_l2_link" pos="-0.0196008 0.00550444 0.0556099" quat="0.499982 0.500018 -0.499982 -0.500018">
-          <inertial pos="-0.032589 8.2716e-05 0.0065541" quat="0.0024465 0.675583 0.000888348 0.737279" mass="0.12555" diaginertia="0.000150473 0.00013015 5.53569e-05"/>
+          <inertial pos="-0.032589 8.2716e-05 0.0065541" quat="0.0024465 0.675583 0.000888348 0.737279" mass="0.15568" diaginertia="0.000186584 0.000161384 6.86417e-05"/>
           <joint name="leg_l2_joint" pos="0 0 0" axis="0 0 -1" range="-0.262 0.75" actuatorfrcrange="-100 100"/>
           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l2_link"/>
           <body name="leg_l3_link" pos="-0.0697588 -1.75243e-05 0.00341301" quat="0.500018 -0.500018 0.499982 -0.499982">
@@ -155,11 +155,11 @@
             <joint name="leg_l3_joint" pos="0 0 0" axis="0 0 -1" range="-0.489 1.361" actuatorfrcrange="-100 100"/>
             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l3_link"/>
             <body name="leg_l4_link" pos="-0.084864 0.0848758 0" quat="0.707107 0 0 -0.707107">
-              <inertial pos="0.013624 -0.085298 0.014354" quat="0.500911 0.497338 -0.488124 0.513301" mass="0.4525" diaginertia="0.000782217 0.00060412 0.000232503"/>
+              <inertial pos="0.013624 -0.085298 0.014354" quat="0.500911 0.497338 -0.488124 0.513301" mass="0.45582" diaginertia="0.000787956 0.000608553 0.000234209"/>
               <joint name="leg_l4_joint" pos="0 0 0" axis="0 0 -1" range="-1.344 0.803" actuatorfrcrange="-100 100"/>
               <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l4_link"/>
               <body name="leg_l5_link" pos="0.036235 -0.13523 -0.00435" quat="1.34924e-11 -3.67321e-06 1 -3.67321e-06">
-                <inertial pos="-0.034306 -0.042595 -0.010554" quat="-0.136962 0.683929 -0.141743 0.702418" mass="0.39976" diaginertia="0.00127757 0.00113059 0.000235971"/>
+                <inertial pos="-0.034306 -0.042595 -0.010554" quat="-0.136962 0.683929 -0.141743 0.702418" mass="0.45151" diaginertia="0.00144295 0.00127695 0.000266518"/>
                 <joint name="leg_l5_joint" pos="0 0 0" axis="0 0 -1" range="-1.134 1.396" actuatorfrcrange="-100 100"/>
                 <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="leg_l5_link"/>
                 <geom name="foot_l" size="0.0926 0.004 0.0149" pos="-0.0261 -0.076 -0.019" type="box" friction="0.5 0.02 0.001" rgba="0.8 0.2 0.2 0.3"/>
