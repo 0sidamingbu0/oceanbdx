@@ -58,7 +58,12 @@ LEG_JOINTS = ["leg_r1_joint", "leg_r2_joint", "leg_r3_joint", "leg_r4_joint", "l
 NECK_JOINTS = ["neck_n1_joint", "neck_n2_joint", "neck_n3_joint", "neck_n4_joint"]
 # 动作向量顺序 = 腿 10 + 脖子 4（与训练侧 action 布局一致），调试打印按此索引
 ACTION_JOINTS = LEG_JOINTS + NECK_JOINTS
-GROUND_GEOM_NAMES = ("floor", "slope_terrain", "rough_terrain")
+GROUND_GEOM_NAMES = (
+    "floor",
+    "slope_terrain",
+    "steep_slope_terrain",
+    "rough_terrain",
+)
 
 
 def quat_rotate_inverse_gravity(q):

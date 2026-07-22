@@ -43,6 +43,21 @@ SLOPE_NCOL = int(round(SLOPE_LENGTH / TERRAIN_GRID)) + 1
 SLOPE_NROW = int(round(SLOPE_WIDTH / TERRAIN_GRID)) + 1
 SLOPE_PEAK_HEIGHT = SLOPE_RAMP_LENGTH * np.tan(np.deg2rad(SLOPE_ANGLE_DEG))
 
+# A separate steep up/plateau/down obstacle is in the robot's right lane.
+STEEP_SLOPE_ANGLE_DEG = 12.0
+STEEP_SLOPE_RAMP_LENGTH = 0.6
+STEEP_SLOPE_PLATEAU_LENGTH = 0.6
+STEEP_SLOPE_LENGTH = 2.0 * STEEP_SLOPE_RAMP_LENGTH + STEEP_SLOPE_PLATEAU_LENGTH
+STEEP_SLOPE_WIDTH = 1.2
+STEEP_SLOPE_X_MAX = -1.2
+STEEP_SLOPE_X_MIN = STEEP_SLOPE_X_MAX - STEEP_SLOPE_LENGTH
+STEEP_SLOPE_CENTER_Y = 2.1
+STEEP_SLOPE_NCOL = int(round(STEEP_SLOPE_LENGTH / TERRAIN_GRID)) + 1
+STEEP_SLOPE_NROW = int(round(STEEP_SLOPE_WIDTH / TERRAIN_GRID)) + 1
+STEEP_SLOPE_PEAK_HEIGHT = STEEP_SLOPE_RAMP_LENGTH * np.tan(
+    np.deg2rad(STEEP_SLOPE_ANGLE_DEG)
+)
+
 # The rough patch is to the robot's left (world -Y).  Interior samples match the
 # IsaacLab rough task: 5 cm cells, 4 mm steps and heights relative to +/-12 mm.
 ROUGH_SIZE = 2.5
@@ -55,17 +70,37 @@ ROUGH_SEED = 20260713
 ROUGH_BLEND_CELLS = 5
 
 
-def make_slope_heights():
-    """Return physical slope heights before MuJoCo normalizes the hfield asset."""
-    x = np.linspace(SLOPE_X_MIN, SLOPE_X_MAX, SLOPE_NCOL)
-    distance_from_near_edge = SLOPE_X_MAX - x
+def make_ramp_heights(angle_deg, ramp_length, plateau_length, nrow, ncol):
+    """Return a symmetric up/plateau/down profile before MuJoCo normalization."""
+    length = 2.0 * ramp_length + plateau_length
+    distance_from_near_edge = np.linspace(length, 0.0, ncol)
     height = np.minimum.reduce([
         distance_from_near_edge,
-        SLOPE_LENGTH - distance_from_near_edge,
-        np.full_like(x, SLOPE_RAMP_LENGTH),
+        length - distance_from_near_edge,
+        np.full(ncol, ramp_length),
     ])
-    height = np.clip(height, 0.0, None) * np.tan(np.deg2rad(SLOPE_ANGLE_DEG))
-    return np.repeat(height[np.newaxis, :], SLOPE_NROW, axis=0)
+    height = np.clip(height, 0.0, None) * np.tan(np.deg2rad(angle_deg))
+    return np.repeat(height[np.newaxis, :], nrow, axis=0)
+
+
+def make_slope_heights():
+    return make_ramp_heights(
+        SLOPE_ANGLE_DEG,
+        SLOPE_RAMP_LENGTH,
+        SLOPE_PLATEAU_LENGTH,
+        SLOPE_NROW,
+        SLOPE_NCOL,
+    )
+
+
+def make_steep_slope_heights():
+    return make_ramp_heights(
+        STEEP_SLOPE_ANGLE_DEG,
+        STEEP_SLOPE_RAMP_LENGTH,
+        STEEP_SLOPE_PLATEAU_LENGTH,
+        STEEP_SLOPE_NROW,
+        STEEP_SLOPE_NCOL,
+    )
 
 
 def make_rough_heights():
@@ -87,7 +122,7 @@ def make_rough_heights():
 
 
 def add_test_terrains(spec):
-    """Add separately reachable slope and rough test regions around the flat spawn."""
+    """Add separately reachable slope, steep-slope, and rough test regions."""
     slope_heights = make_slope_heights()
     spec.add_hfield(
         name="slope_heightfield",
@@ -104,6 +139,32 @@ def add_test_terrains(spec):
     slope.friction = GROUND_FRICTION
     slope.group = 2
     slope.rgba = [0.28, 0.50, 0.28, 1.0]
+
+    steep_heights = make_steep_slope_heights()
+    spec.add_hfield(
+        name="steep_slope_heightfield",
+        size=[
+            STEEP_SLOPE_LENGTH / 2.0,
+            STEEP_SLOPE_WIDTH / 2.0,
+            STEEP_SLOPE_PEAK_HEIGHT,
+            0.05,
+        ],
+        nrow=STEEP_SLOPE_NROW,
+        ncol=STEEP_SLOPE_NCOL,
+        userdata=steep_heights.ravel(),
+    )
+    steep = spec.worldbody.add_geom()
+    steep.name = "steep_slope_terrain"
+    steep.type = mujoco.mjtGeom.mjGEOM_HFIELD
+    steep.hfieldname = "steep_slope_heightfield"
+    steep.pos = [
+        (STEEP_SLOPE_X_MIN + STEEP_SLOPE_X_MAX) / 2.0,
+        STEEP_SLOPE_CENTER_Y,
+        TERRAIN_Z_OFFSET,
+    ]
+    steep.friction = GROUND_FRICTION
+    steep.group = 2
+    steep.rgba = [0.65, 0.28, 0.18, 1.0]
 
     rough_heights = make_rough_heights()
     spec.add_hfield(
@@ -237,7 +298,14 @@ def main():
         dof = model.joint(name).dofadr[0]
         assert np.isclose(model.dof_armature[dof], 0.01)
         assert np.isclose(model.dof_damping[dof], 0.05)
-    for name in ("floor", "foot_r", "foot_l", "slope_terrain", "rough_terrain"):
+    for name in (
+        "floor",
+        "foot_r",
+        "foot_l",
+        "slope_terrain",
+        "steep_slope_terrain",
+        "rough_terrain",
+    ):
         np.testing.assert_allclose(model.geom(name).friction, GROUND_FRICTION)
 
     names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
@@ -245,6 +313,9 @@ def main():
     print(f"nq={model.nq} nv={model.nv} joints={names}")
     print(
         f"terrain: slope {SLOPE_ANGLE_DEG:.1f}deg x=[{SLOPE_X_MIN:.1f},{SLOPE_X_MAX:.1f}], "
+        f"steep {STEEP_SLOPE_ANGLE_DEG:.1f}deg "
+        f"x=[{STEEP_SLOPE_X_MIN:.1f},{STEEP_SLOPE_X_MAX:.1f}] "
+        f"y={STEEP_SLOPE_CENTER_Y:.1f}, "
         f"rough {ROUGH_SIZE:.1f}m square centered at {ROUGH_CENTER.tolist()}"
     )
 

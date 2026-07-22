@@ -52,7 +52,14 @@ class TerrainSceneTest(unittest.TestCase):
 
     def test_scene_preserves_runtime_dynamics(self):
         expected_friction = np.array([0.5, 0.02, 0.001])
-        for name in ("floor", "foot_r", "foot_l", "slope_terrain", "rough_terrain"):
+        for name in (
+            "floor",
+            "foot_r",
+            "foot_l",
+            "slope_terrain",
+            "steep_slope_terrain",
+            "rough_terrain",
+        ):
             np.testing.assert_allclose(self.model.geom(name).friction, expected_friction)
 
         for name in terrain.LEG_JOINTS:
@@ -119,6 +126,38 @@ class TerrainSceneTest(unittest.TestCase):
             terrain.TERRAIN_Z_OFFSET + terrain.ROUGH_HEIGHT_MAX + 1.0e-6,
         )
 
+    def test_steep_slope_matches_configured_profile(self):
+        approach_x = terrain.STEEP_SLOPE_X_MAX + 0.05
+        height, name = self.terrain_height(approach_x, terrain.STEEP_SLOPE_CENTER_Y)
+        self.assertEqual(name, "floor")
+        self.assertAlmostEqual(height, 0.0, places=6)
+
+        half_ramp_x = (
+            terrain.STEEP_SLOPE_X_MAX - terrain.STEEP_SLOPE_RAMP_LENGTH / 2.0
+        )
+        height, name = self.terrain_height(
+            half_ramp_x, terrain.STEEP_SLOPE_CENTER_Y
+        )
+        self.assertEqual(name, "steep_slope_terrain")
+        expected = (
+            terrain.TERRAIN_Z_OFFSET
+            + 0.5
+            * terrain.STEEP_SLOPE_RAMP_LENGTH
+            * np.tan(np.deg2rad(terrain.STEEP_SLOPE_ANGLE_DEG))
+        )
+        self.assertAlmostEqual(height, expected, places=5)
+
+        plateau_x = (
+            terrain.STEEP_SLOPE_X_MIN + terrain.STEEP_SLOPE_X_MAX
+        ) / 2.0
+        height, name = self.terrain_height(plateau_x, terrain.STEEP_SLOPE_CENTER_Y)
+        self.assertEqual(name, "steep_slope_terrain")
+        self.assertAlmostEqual(
+            height,
+            terrain.TERRAIN_Z_OFFSET + terrain.STEEP_SLOPE_PEAK_HEIGHT,
+            places=5,
+        )
+
     def test_spawn_and_routes_are_separate(self):
         spawn_height, name = self.terrain_height(0.4, 0.4)
         self.assertEqual(name, "floor")
@@ -127,6 +166,9 @@ class TerrainSceneTest(unittest.TestCase):
         slope_y_min = -terrain.SLOPE_WIDTH / 2.0
         rough_y_max = terrain.ROUGH_CENTER[1] + terrain.ROUGH_SIZE / 2.0
         self.assertLess(rough_y_max, slope_y_min)
+        slope_y_max = terrain.SLOPE_WIDTH / 2.0
+        steep_y_min = terrain.STEEP_SLOPE_CENTER_Y - terrain.STEEP_SLOPE_WIDTH / 2.0
+        self.assertLess(slope_y_max, steep_y_min)
 
     def test_contact_diagnostics_accept_every_ground_region(self):
         args = SimpleNamespace(
@@ -147,15 +189,20 @@ class TerrainSceneTest(unittest.TestCase):
         self.assertSetEqual(set(sim.ground_geom_ids), expected)
 
         right_gid, left_gid = sim.foot_geom_ids
-        floor_gid, slope_gid, rough_gid = [sim.model.geom(name).id for name in ms.GROUND_GEOM_NAMES]
+        ground_ids = {
+            name: sim.model.geom(name).id for name in ms.GROUND_GEOM_NAMES
+        }
         contacts = [
-            SimpleNamespace(geom1=left_gid, geom2=slope_gid),
-            SimpleNamespace(geom1=rough_gid, geom2=right_gid),
+            SimpleNamespace(geom1=left_gid, geom2=ground_ids["slope_terrain"]),
+            SimpleNamespace(geom1=ground_ids["rough_terrain"], geom2=right_gid),
+            SimpleNamespace(
+                geom1=left_gid, geom2=ground_ids["steep_slope_terrain"]
+            ),
             SimpleNamespace(geom1=left_gid, geom2=sim.model.geom("stool").id),
-            SimpleNamespace(geom1=floor_gid, geom2=right_gid),
+            SimpleNamespace(geom1=ground_ids["floor"], geom2=right_gid),
         ]
         sim.data = SimpleNamespace(ncon=len(contacts), contact=contacts)
-        forces = [5.0, 7.0, 100.0, 3.0]
+        forces = [5.0, 7.0, 11.0, 100.0, 3.0]
 
         def contact_force(_model, _data, index, output):
             output[:] = 0.0
@@ -163,7 +210,7 @@ class TerrainSceneTest(unittest.TestCase):
 
         with mock.patch.object(mujoco, "mj_contactForce", side_effect=contact_force):
             left, right = sim.foot_contact_forces()
-        self.assertEqual(left, 5.0)
+        self.assertEqual(left, 16.0)
         self.assertEqual(right, 10.0)
 
 
