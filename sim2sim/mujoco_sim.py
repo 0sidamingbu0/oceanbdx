@@ -589,20 +589,38 @@ class Sim:
         self.motor_qd_s = 0.1
         cutoff = float(sim2sim_ctrl.get("action_lowpass_cutoff_hz", 37.5))
         self.target_lowpass_alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff * self.control_dt)
-        self.neck_target_velocity_limit = float(
-            sim2sim_ctrl.get("neck_target_velocity_limit", 1.0)
+        neck_velocity_limit = np.asarray(
+            sim2sim_ctrl.get("neck_target_velocity_limit", [1.5, 1.5, 2.5, 1.5]),
+            dtype=float,
         )
-        self.neck_target_acceleration_limit = float(
-            sim2sim_ctrl.get("neck_target_acceleration_limit", 12.0)
+        if neck_velocity_limit.ndim == 0:
+            neck_velocity_limit = np.full(len(NECK_JOINTS), float(neck_velocity_limit))
+        if neck_velocity_limit.shape != (len(NECK_JOINTS),):
+            raise ValueError(
+                "sim2sim.neck_target_velocity_limit must be a scalar or one value per neck joint"
+            )
+        self.neck_target_velocity_limit = neck_velocity_limit
+        neck_acceleration_limit = np.asarray(
+            sim2sim_ctrl.get("neck_target_acceleration_limit", [12.0, 12.0, 20.0, 12.0]),
+            dtype=float,
         )
+        if neck_acceleration_limit.ndim == 0:
+            neck_acceleration_limit = np.full(
+                len(NECK_JOINTS), float(neck_acceleration_limit)
+            )
+        if neck_acceleration_limit.shape != (len(NECK_JOINTS),):
+            raise ValueError(
+                "sim2sim.neck_target_acceleration_limit must be a scalar or one value per neck joint"
+            )
+        self.neck_target_acceleration_limit = neck_acceleration_limit
         if (
-            not np.isfinite(self.neck_target_velocity_limit)
-            or self.neck_target_velocity_limit <= 0.0
+            not np.all(np.isfinite(self.neck_target_velocity_limit))
+            or np.any(self.neck_target_velocity_limit <= 0.0)
         ):
             raise ValueError("sim2sim.neck_target_velocity_limit must be positive and finite")
         if (
-            not np.isfinite(self.neck_target_acceleration_limit)
-            or self.neck_target_acceleration_limit <= 0.0
+            not np.all(np.isfinite(self.neck_target_acceleration_limit))
+            or np.any(self.neck_target_acceleration_limit <= 0.0)
         ):
             raise ValueError(
                 "sim2sim.neck_target_acceleration_limit must be positive and finite"

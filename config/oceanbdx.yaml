@@ -214,8 +214,9 @@ oceanbdx:
     rl_kd: [0.3, 0.3, 0.3, 0.3, 0.3,  0.3, 0.3, 0.3, 0.3, 0.3]
     action_lowpass_cutoff_hz: 37.5
     # 最终脖子位置目标的二阶轨迹限制。先限加速度并在接近目标时提前制动，再限最高速度。
-    neck_target_velocity_limit: 1.0       # [rad/s]
-    neck_target_acceleration_limit: 12.0  # [rad/s^2]
+    # [n1, n2, n3(yaw), n4]；仅左右转头比其他头部动作更快。
+    neck_target_velocity_limit: [1.5, 1.5, 2.5, 1.5]      # [rad/s]
+    neck_target_acceleration_limit: [12.0, 12.0, 20.0, 12.0]  # [rad/s^2]
     neck_torque_limits: [5.0, 5.0, 5.0, 5.0]
     # walk -> stand：仍由 walking policy 完成减速和零命令收脚，再在参考双支撑相位切换。
     # 正式判据只使用真机可靠可得的内部相位、IMU projected gravity/gyro 和腿 q/dq；

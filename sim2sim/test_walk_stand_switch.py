@@ -494,13 +494,20 @@ class WalkStandSwitchTest(unittest.TestCase):
         accelerations = np.diff(
             np.vstack([np.zeros((1, self.sim.n_neck)), velocities]), axis=0
         ) / self.sim.control_dt
-        self.assertLessEqual(
-            float(np.max(np.abs(velocities))),
-            self.sim.neck_target_velocity_limit + 1.0e-5,
+        peak_velocity = np.max(np.abs(velocities), axis=0)
+        self.assertTrue(
+            np.all(peak_velocity <= self.sim.neck_target_velocity_limit + 1.0e-5)
         )
-        self.assertLessEqual(
-            float(np.max(np.abs(accelerations))),
-            self.sim.neck_target_acceleration_limit + 5.0e-3,
+        self.assertGreater(peak_velocity[2], np.max(peak_velocity[[0, 1, 3]]) + 0.4)
+        peak_acceleration = np.max(np.abs(accelerations), axis=0)
+        self.assertTrue(
+            np.all(
+                peak_acceleration
+                <= self.sim.neck_target_acceleration_limit + 5.0e-3
+            )
+        )
+        self.assertGreater(
+            peak_acceleration[2], np.max(peak_acceleration[[0, 1, 3]]) + 7.0
         )
         np.testing.assert_allclose(self.sim.neck_target, -desired, atol=2.0e-3)
 
